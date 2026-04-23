@@ -515,7 +515,12 @@ class Sweep:
                 )
             from pathlib import Path
 
-            snapshot_dir = Path(self.snapshot_dir) if self.snapshot_dir else Path(self.model)
+            from fpwap.loader import resolve_snapshot_dir
+
+            if self.snapshot_dir is not None:
+                snapshot_dir = Path(self.snapshot_dir)
+            else:
+                snapshot_dir = resolve_snapshot_dir(self.model)
             model, accel_index = build_empty_model_and_index(
                 model_id=self.model,
                 snapshot_dir=snapshot_dir,

@@ -26,10 +26,10 @@ import time
 from pathlib import Path
 
 import torch
-from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from fpwap import Callback, Sweep
+from fpwap.loader import resolve_snapshot_dir
 from fpwap.types import BatchResult, HookName
 
 
@@ -81,13 +81,6 @@ def _build_dataset(
         }
         for i in range(n_samples)
     ]
-
-
-def _resolve_snapshot_dir(model_id: str) -> Path:
-    p = Path(model_id)
-    if p.is_dir():
-        return p
-    return Path(snapshot_download(model_id, local_files_only=True))
 
 
 def _run_one_n_fpwap(
@@ -214,7 +207,7 @@ def main() -> None:
     device = torch.device(args.device)
     ns = [int(x) for x in args.ns.split(",")]
 
-    snapshot_dir = _resolve_snapshot_dir(args.model)
+    snapshot_dir = resolve_snapshot_dir(args.model)
     tokenizer = AutoTokenizer.from_pretrained(snapshot_dir)
 
     rows: list[tuple[object, ...]] = []

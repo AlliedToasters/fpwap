@@ -5,8 +5,35 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from torch import nn
+
+
+def resolve_snapshot_dir(model: str) -> Path:
+    """Resolve `model` to a local HF snapshot directory.
+
+    - If `model` is an existing directory, return it as a Path.
+    - Otherwise treat it as a hub id and resolve via the local HF cache
+      (`snapshot_download(..., local_files_only=True)`). If the model isn't
+      cached, re-raise with an actionable message that names the id.
+
+    Centralizing this lets `Sweep(model="meta-llama/...")` Just Work for
+    consumers who have the model cached, without every call site
+    re-implementing the dance.
+    """
+    p = Path(model)
+    if p.is_dir():
+        return p
+    try:
+        return Path(snapshot_download(model, local_files_only=True))
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"fpwap could not resolve model {model!r} to a local snapshot. "
+            f"Either pass an existing snapshot directory, or pre-cache the "
+            f"model with `huggingface-cli download {model}` (or equivalent "
+            f"`snapshot_download({model!r})`). Underlying error: {exc}"
+        ) from exc
 
 _SAFE_TO_TORCH_DTYPE: dict[str, str] = {
     "F64": "float64",
