@@ -11,6 +11,8 @@ DispatchFn = Callable[[str, Tensor], Tensor]
 class ModelPlumbing(Protocol):
     """Per-family hook plumbing. Implementations live in fpwap/models/<family>.py."""
 
+    uses_learned_positions: bool
+
     def matches(self, model: nn.Module) -> bool: ...
 
     def layer_modules(self, model: nn.Module) -> Sequence[nn.Module]: ...
