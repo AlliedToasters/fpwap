@@ -50,7 +50,7 @@ def test_build_empty_model_and_index(tmp_path: Path) -> None:
     snapshot_dir = tmp_path / "snapshot"
     _write_tiny_gpt2_snapshot(snapshot_dir)
 
-    model, accel_index = build_empty_model_and_index(
+    model, accel_index, timing = build_empty_model_and_index(
         model_id=str(snapshot_dir),
         snapshot_dir=snapshot_dir,
         dtype=torch.bfloat16,
@@ -64,6 +64,11 @@ def test_build_empty_model_and_index(tmp_path: Path) -> None:
     assert "lm_head.weight" in accel_index
     assert "transformer.wte.weight" in accel_index
     assert accel_index["lm_head.weight"] == accel_index["transformer.wte.weight"]
+
+    # Setup timing sub-phases are populated.
+    assert timing["config_s"] > 0
+    assert timing["model_s"] > 0
+    assert timing["index_s"] > 0
 
 
 def test_load_from_cache_writes_index_before_disk_offload(tmp_path: Path) -> None:

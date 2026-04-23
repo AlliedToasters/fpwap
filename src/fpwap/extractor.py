@@ -55,7 +55,7 @@ class Extractor:
         else:
             sdir = resolve_snapshot_dir(model_id)
 
-        model, accel_index = build_empty_model_and_index(
+        model, accel_index, _ = build_empty_model_and_index(
             model_id=model_id, snapshot_dir=sdir, dtype=dtype,
         )
         return cls(

@@ -146,7 +146,7 @@ def _run_warm(
             execution_device=device,
             microbatch_size=microbatch,
             seed=0,
-            progress=False,
+            progress=True,
             apply_final_norm=False,
             buffer_device=buffer_device,
         )
@@ -187,7 +187,7 @@ def _run_cold(
             execution_device=device,
             microbatch_size=microbatch,
             seed=0,
-            progress=False,
+            progress=True,
             apply_final_norm=False,
             buffer_device=buffer_device,
         )

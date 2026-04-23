@@ -10,12 +10,15 @@ This script sweeps N for a fixed model/seq_len and dumps (wall_s,
 throughput, peak_gpu_mb, peak_cpu_mb) per N. Output is CSV so it merges
 with the team's existing benchmark harness without format surgery.
 
+Streaming mode uses the Extractor warm-start path so model setup cost is
+paid once, not once per N.
+
 Usage (hero curve — the killer plot):
     uv run scripts/bench_n_scaling.py \\
         --model meta-llama/Llama-3.3-70B-Instruct \\
         --seq-len 256 --microbatch 128 --mode streaming \\
         --ns 8,64,512,4096 --buffer-device cpu \\
-        --out /tmp/fpwap_70b_n_scaling.csv
+        --out bench/results/70b_streaming_n_scaling.csv
 """
 from __future__ import annotations
 
@@ -24,19 +27,17 @@ import csv
 import resource
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from fpwap import Callback, Sweep
+from fpwap import Callback, Extractor, Sweep
 from fpwap.loader import resolve_snapshot_dir
 from fpwap.types import BatchResult, HookName
 
 
 class NullCapture(Callback):
-    """Minimal callback — forces the forward work to land without shaping
-    the measurement. One int-reduction per microbatch per layer."""
-
     phase = "read"
     target_layers = "all"
     target_hooks: tuple[HookName, ...] = ("residual_post",)
@@ -56,7 +57,7 @@ class NullCapture(Callback):
 
 
 def _build_dataset(
-    tokenizer,
+    tokenizer: Any,
     n_samples: int,
     seq_len: int,
     device: torch.device,
@@ -83,9 +84,8 @@ def _build_dataset(
     ]
 
 
-def _run_one_n_fpwap(
-    snapshot_dir: Path,
-    mode: str,
+def _run_one_n_streaming(
+    ext: Extractor,
     dataset: list[dict[str, torch.Tensor]],
     dtype: torch.dtype,
     device: torch.device,
@@ -93,38 +93,20 @@ def _run_one_n_fpwap(
     microbatch: int,
     buffer_device: str | None,
 ) -> tuple[float, int]:
-    """One fpwap run at fixed N. Returns (wall_s, n_layers)."""
+    """Streaming sweep via Extractor handle (warm-start — no per-N rebuild)."""
     cb = NullCapture()
-    if mode == "preloaded":
-        model_obj = AutoModelForCausalLM.from_pretrained(
-            snapshot_dir, dtype=dtype, low_cpu_mem_usage=True
-        ).to(device)
-        model_obj.eval()
-        sweep = Sweep(
-            model=model_obj,
-            dataset=dataset,
-            seq_len=seq_len,
-            callbacks=[cb],
-            transport_dtype=dtype,
-            microbatch_size=microbatch,
-            seed=0,
-            progress=False,
-            buffer_device=buffer_device,
-        )
-    else:
-        sweep = Sweep(
-            model=str(snapshot_dir),
-            execution_device=str(device),
-            dataset=dataset,
-            seq_len=seq_len,
-            callbacks=[cb],
-            transport_dtype=dtype,
-            microbatch_size=microbatch,
-            seed=0,
-            progress=False,
-            buffer_device=buffer_device,
-        )
-
+    sweep = ext.sweep(
+        dataset=dataset,
+        seq_len=seq_len,
+        callbacks=[cb],
+        transport_dtype=dtype,
+        execution_device=str(device),
+        microbatch_size=microbatch,
+        seed=0,
+        progress=True,
+        apply_final_norm=False,
+        buffer_device=buffer_device,
+    )
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -132,6 +114,45 @@ def _run_one_n_fpwap(
     if device.type == "cuda":
         torch.cuda.synchronize()
     wall_s = time.perf_counter() - t0
+    print(result.profile.summary())
+    return wall_s, len(result.profile.per_layer)
+
+
+def _run_one_n_preloaded(
+    snapshot_dir: Path,
+    dataset: list[dict[str, torch.Tensor]],
+    dtype: torch.dtype,
+    device: torch.device,
+    seq_len: int,
+    microbatch: int,
+    buffer_device: str | None,
+) -> tuple[float, int]:
+    """Preloaded sweep — model fully resident on GPU."""
+    cb = NullCapture()
+    model_obj = AutoModelForCausalLM.from_pretrained(
+        snapshot_dir, dtype=dtype, low_cpu_mem_usage=True
+    ).to(device)
+    model_obj.eval()
+    sweep = Sweep(
+        model=model_obj,
+        dataset=dataset,
+        seq_len=seq_len,
+        callbacks=[cb],
+        transport_dtype=dtype,
+        microbatch_size=microbatch,
+        seed=0,
+        progress=True,
+        buffer_device=buffer_device,
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    result = sweep.run()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    wall_s = time.perf_counter() - t0
+    print(result.profile.summary())
+    del model_obj
     return wall_s, len(result.profile.per_layer)
 
 
@@ -210,6 +231,13 @@ def main() -> None:
     snapshot_dir = resolve_snapshot_dir(args.model)
     tokenizer = AutoTokenizer.from_pretrained(snapshot_dir)
 
+    ext: Extractor | None = None
+    if args.mode == "streaming":
+        print(f"[bench] building Extractor for {args.model} ...")
+        t0_ext = time.perf_counter()
+        ext = Extractor.from_hf(args.model, dtype=dtype)
+        print(f"[bench] Extractor ready in {time.perf_counter() - t0_ext:.1f}s")
+
     rows: list[tuple[object, ...]] = []
     header: tuple[str, ...] = (
         "model",
@@ -230,19 +258,18 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
 
+        mb = min(args.microbatch, n)
+
         if args.mode == "naive":
-            mb = min(args.microbatch, n)
             wall_s, n_layers = _run_one_n_naive(snapshot_dir, dataset, dtype, device, mb)
+        elif args.mode == "streaming":
+            assert ext is not None
+            wall_s, n_layers = _run_one_n_streaming(
+                ext, dataset, dtype, device, args.seq_len, mb, args.buffer_device,
+            )
         else:
-            wall_s, n_layers = _run_one_n_fpwap(
-                snapshot_dir,
-                args.mode,
-                dataset,
-                dtype,
-                device,
-                args.seq_len,
-                min(args.microbatch, n),
-                args.buffer_device,
+            wall_s, n_layers = _run_one_n_preloaded(
+                snapshot_dir, dataset, dtype, device, args.seq_len, mb, args.buffer_device,
             )
 
         total_tokens = n * args.seq_len
@@ -257,7 +284,7 @@ def main() -> None:
             args.mode,
             n,
             args.seq_len,
-            min(args.microbatch, n),
+            mb,
             f"{wall_s:.2f}",
             f"{tok_s:.1f}",
             f"{peak_gpu_mb:.1f}",
@@ -267,7 +294,6 @@ def main() -> None:
         rows.append(row)
         print("  ".join(f"{str(v):>12}" for v in row))
 
-        # free before next N to avoid accumulating VRAM/RAM pressure
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
