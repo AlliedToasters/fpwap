@@ -1,5 +1,6 @@
 from fpwap.callbacks.base import Callback
 from fpwap.engine import Result, Sweep
+from fpwap.extractor import Extractor
 from fpwap.types import (
     Artifact,
     ArtifactKey,
@@ -15,6 +16,7 @@ __all__ = [
     "Callback",
     "Context",
     "Emit",
+    "Extractor",
     "LayerArtifact",
     "Result",
     "Sweep",
