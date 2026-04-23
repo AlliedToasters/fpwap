@@ -174,7 +174,8 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="HF model id or local snapshot path")
     parser.add_argument("--n-samples", type=int, default=128)
     parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--microbatch", type=int, default=None)
+    parser.add_argument("--microbatch", default=None,
+                        help="microbatch size (int or 'auto')")
     parser.add_argument(
         "--mode",
         choices=["preloaded", "streaming", "naive"],
@@ -200,8 +201,12 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(snapshot_dir)
     dataset = _build_synthetic_dataset(tokenizer, args.n_samples, args.seq_len, device)
 
+    microbatch_val: int | str | None = None
+    if args.microbatch is not None:
+        microbatch_val = "auto" if args.microbatch == "auto" else int(args.microbatch)
+
     if args.mode == "naive":
-        mb = args.microbatch if args.microbatch is not None else 1
+        mb = microbatch_val if isinstance(microbatch_val, int) else 1
         print(f"[benchmark] naive cpu_offload: {args.model} from {snapshot_dir}")
         wall_s, total_tokens, n_layers = _run_naive(
             snapshot_dir, dataset, dtype, device, mb
@@ -245,8 +250,8 @@ def main() -> None:
     }
     if args.mode == "streaming":
         kwargs["execution_device"] = execution_device
-    if args.microbatch is not None:
-        kwargs["microbatch_size"] = args.microbatch
+    if microbatch_val is not None:
+        kwargs["microbatch_size"] = microbatch_val
     if args.buffer_device is not None:
         kwargs["buffer_device"] = args.buffer_device
 

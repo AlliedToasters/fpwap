@@ -4,7 +4,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor, nn
@@ -412,6 +412,55 @@ def _has_attention_mask(items: list[Any]) -> bool:
     return False
 
 
+def estimate_max_microbatch(
+    config: Any,
+    n_samples: int,
+    seq_len: int,
+    transport_dtype: torch.dtype,
+    exec_device: torch.device,
+    buf_on_gpu: bool = True,
+    safety_factor: float = 0.85,
+) -> int:
+    """Estimate the largest microbatch size that fits in VRAM.
+
+    Uses model config attributes and total device memory to compute a
+    conservative upper bound.  Returns *n_samples* on CPU or when config
+    is missing required attributes.
+    """
+    if exec_device.type != "cuda":
+        return n_samples
+
+    hidden = int(getattr(config, "hidden_size", 0))
+    if hidden == 0:
+        return n_samples
+    intermediate = int(getattr(config, "intermediate_size", None) or hidden * 4)
+    n_heads = int(getattr(config, "num_attention_heads", None) or hidden // 128)
+    vocab = int(getattr(config, "vocab_size", 32000))
+
+    dtype_bytes = torch.empty((), dtype=transport_dtype).element_size()
+
+    buf_bytes = n_samples * seq_len * hidden * dtype_bytes if buf_on_gpu else 0
+    layer_bytes = (4 * hidden * hidden + 3 * hidden * intermediate) * dtype_bytes
+    embed_bytes = vocab * hidden * dtype_bytes
+    # Two layers may coexist on GPU during prefetch overlap.
+    reserved = buf_bytes + 2 * layer_bytes + embed_bytes
+
+    total_vram = torch.cuda.get_device_properties(exec_device).total_memory
+    available = max(0, int(total_vram * safety_factor) - reserved)
+
+    # Per-sample peak activation: MLP gate+up alive simultaneously + residual.
+    per_sample = seq_len * dtype_bytes * (hidden + 3 * intermediate)
+    per_sample += n_heads * seq_len * seq_len * dtype_bytes
+
+    if per_sample <= 0:
+        return n_samples
+
+    max_mb = max(1, available // per_sample)
+    if max_mb >= 2:
+        max_mb = 1 << (max_mb.bit_length() - 1)
+    return min(max_mb, n_samples)
+
+
 class Sweep:
     """The engine. Inverts the inference loop: for each layer, run the dataset.
 
@@ -430,7 +479,7 @@ class Sweep:
         verify: bool = False,
         progress: bool | ProgressReporter = True,
         seed: int = 0,
-        microbatch_size: int | None = None,
+        microbatch_size: int | Literal["auto"] | None = None,
         snapshot_dir: str | None = None,
         offload_dir: str | None = None,
         execution_device: torch.device | str | None = None,
@@ -448,7 +497,7 @@ class Sweep:
         self.verify = verify
         self.progress = progress
         self.seed = seed
-        self.microbatch_size = microbatch_size
+        self.microbatch_size: int | Literal["auto"] | None = microbatch_size
         self.snapshot_dir = snapshot_dir
         self.offload_dir = offload_dir
         self.apply_final_norm = apply_final_norm
@@ -494,7 +543,27 @@ class Sweep:
         hidden_attr = getattr(config, "hidden_size", None) if config is not None else None
         hidden = int(hidden_attr) if hidden_attr is not None else 0
         n_layers = len(plumbing.layer_modules(model))
-        mb_size = self.microbatch_size or min(n_samples, 8)
+        if self.microbatch_size == "auto":
+            if isinstance(buf_device, torch.device):
+                buf_on_gpu = buf_device.type == "cuda"
+            else:
+                buf_on_gpu = "cuda" in str(buf_device)
+            if isinstance(exec_device, torch.device):
+                dev = exec_device
+            else:
+                dev = torch.device(exec_device)
+            mb_size = estimate_max_microbatch(
+                config=config,
+                n_samples=n_samples,
+                seq_len=self.seq_len,
+                transport_dtype=self.transport_dtype,
+                exec_device=dev,
+                buf_on_gpu=buf_on_gpu,
+            )
+        elif self.microbatch_size is not None:
+            mb_size = self.microbatch_size
+        else:
+            mb_size = min(n_samples, 8)
 
         element_bytes = (
             torch.zeros((), dtype=self.transport_dtype).element_size() if hidden else 2
@@ -606,11 +675,34 @@ class Sweep:
         if n_samples == 0:
             raise ValueError("fpwap dataset is empty")
 
-        mb_size = self.microbatch_size or n_samples
-
         first_ids = items[0]["input_ids"]
         exec_device = streamer.execution_device or first_ids.device
         buf_device = self.buffer_device or exec_device
+
+        config = getattr(model, "config", None)
+        hidden_attr = getattr(config, "hidden_size", None) if config is not None else None
+
+        if self.microbatch_size == "auto":
+            if isinstance(buf_device, torch.device):
+                buf_on_gpu = buf_device.type == "cuda"
+            else:
+                buf_on_gpu = "cuda" in str(buf_device)
+            if isinstance(exec_device, torch.device):
+                dev = exec_device
+            else:
+                dev = torch.device(exec_device)
+            mb_size = estimate_max_microbatch(
+                config=config,
+                n_samples=n_samples,
+                seq_len=self.seq_len,
+                transport_dtype=self.transport_dtype,
+                exec_device=dev,
+                buf_on_gpu=buf_on_gpu,
+            )
+        elif self.microbatch_size is not None:
+            mb_size = self.microbatch_size
+        else:
+            mb_size = n_samples
 
         # verify=True: one-shot naive forward over the dataset, capturing
         # every block's residual_post. The main loop diffs its output
@@ -620,8 +712,6 @@ class Sweep:
             verify_baseline = _run_naive_baseline(
                 model, plumbing, items, exec_device, mb_size
             )
-        config = getattr(model, "config", None)
-        hidden_attr = getattr(config, "hidden_size", None) if config is not None else None
         if hidden_attr is None:
             raise NotImplementedError(
                 "model.config.hidden_size is required to size the residual buffer"
