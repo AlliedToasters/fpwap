@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -127,25 +128,37 @@ def build_empty_model_and_index(
     model_id: str,
     snapshot_dir: Path,
     dtype: torch.dtype = torch.bfloat16,
-) -> tuple[nn.Module, dict[str, dict[str, Any]]]:
+) -> tuple[nn.Module, dict[str, dict[str, Any]], dict[str, float]]:
     """Construct an empty-weights model and the accelerate index for its shards.
 
     This is the lower-level helper fpwap's engine uses directly: the model
     stays on meta device, and the returned index is suitable for constructing
     an OffloadedWeightsLoader that mmap's weights from the HF cache. No
     AlignDevicesHook is installed.
+
+    Returns (model, accel_index, timing_dict) where timing_dict has keys
+    config_s, model_s, index_s for sub-phase breakdowns.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    t0 = time.perf_counter_ns()
     config = AutoConfig.from_pretrained(model_id)
+    config_s = (time.perf_counter_ns() - t0) / 1e9
+
+    t0 = time.perf_counter_ns()
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)  # type: ignore[no-untyped-call]
     model.tie_weights()  # MUST precede index construction — SPEC D.2
+    model_s = (time.perf_counter_ns() - t0) / 1e9
 
+    t0 = time.perf_counter_ns()
     accel_index = build_accel_index_from_hf_cache(Path(snapshot_dir))
     alias_tied_weights_in_index(model, accel_index)
-    return model, accel_index
+    index_s = (time.perf_counter_ns() - t0) / 1e9
+
+    timing = {"config_s": config_s, "model_s": model_s, "index_s": index_s}
+    return model, accel_index, timing
 
 
 def load_from_cache(
@@ -172,7 +185,7 @@ def load_from_cache(
     if execution_device is None:
         execution_device = torch.device("cuda:0")
 
-    model, accel_index = build_empty_model_and_index(
+    model, accel_index, _ = build_empty_model_and_index(
         model_id=model_id, snapshot_dir=snapshot_dir, dtype=dtype
     )
 

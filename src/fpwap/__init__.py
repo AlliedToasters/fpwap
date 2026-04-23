@@ -1,5 +1,5 @@
 from fpwap.callbacks.base import Callback
-from fpwap.engine import Result, Sweep
+from fpwap.engine import ProfileReport, Result, SetupTiming, Sweep
 from fpwap.extractor import Extractor
 from fpwap.types import (
     Artifact,
@@ -18,7 +18,9 @@ __all__ = [
     "Emit",
     "Extractor",
     "LayerArtifact",
+    "ProfileReport",
     "Result",
+    "SetupTiming",
     "Sweep",
     "WriteBack",
 ]

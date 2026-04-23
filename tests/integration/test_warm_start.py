@@ -185,3 +185,69 @@ def test_warm_vs_cold_setup_cost(tmp_path: Path) -> None:
     assert warm_total < cold_total, (
         f"warm ({warm_total:.3f}s) should be faster than cold ({cold_total:.3f}s)"
     )
+
+
+@pytest.mark.integration
+def test_cold_sweep_has_full_phase_profile(tmp_path: Path) -> None:
+    """Cold-path (model=str) sweep populates all profile phases."""
+    snapshot_dir = tmp_path / "snapshot"
+    _write_tiny_gpt2_snapshot(snapshot_dir)
+    dataset = _make_dataset()
+
+    cb = _TouchCounter()
+    sweep = Sweep(
+        model=str(snapshot_dir),
+        dataset=dataset,
+        seq_len=SEQ_LEN,
+        callbacks=[cb],
+        transport_dtype=torch.float32,
+        execution_device="cpu",
+        seed=SEED,
+        progress=False,
+        apply_final_norm=False,
+    )
+    result = sweep.run()
+    p = result.profile
+
+    assert p.total_wall_s > 0
+    assert p.embed_s > 0
+    assert p.loop_s > 0
+    assert p.teardown_s >= 0
+
+    assert p.setup is not None
+    assert p.setup.config_s > 0
+    assert p.setup.model_s > 0
+    assert p.setup.index_s > 0
+    assert p.setup.total_s > 0
+
+    phases_sum = p.embed_s + p.loop_s + p.teardown_s
+    if p.setup is not None:
+        phases_sum += p.setup.total_s
+    assert phases_sum <= p.total_wall_s * 1.01
+
+
+@pytest.mark.integration
+def test_warm_sweep_has_no_setup_timing(tmp_path: Path) -> None:
+    """Warm-path (Extractor reuse) sweep has setup=None."""
+    snapshot_dir = tmp_path / "snapshot"
+    _write_tiny_gpt2_snapshot(snapshot_dir)
+    dataset = _make_dataset()
+
+    ext = Extractor.from_hf(str(snapshot_dir), dtype=torch.float32)
+    cb = _TouchCounter()
+    sweep = ext.sweep(
+        dataset=dataset,
+        seq_len=SEQ_LEN,
+        callbacks=[cb],
+        transport_dtype=torch.float32,
+        execution_device="cpu",
+        seed=SEED,
+        progress=False,
+        apply_final_norm=False,
+    )
+    result = sweep.run()
+    p = result.profile
+
+    assert p.setup is None
+    assert p.embed_s > 0
+    assert p.loop_s > 0

@@ -62,6 +62,21 @@ class LayerTiming:
 
 
 @dataclass
+class SetupTiming:
+    """Breakdown of the setup phase before the main loop starts.
+
+    Captures where wall-clock goes during model resolution, empty-model
+    construction, index building, buffer allocation, and embedding.
+    """
+
+    resolve_s: float = 0.0
+    config_s: float = 0.0
+    model_s: float = 0.0
+    index_s: float = 0.0
+    total_s: float = 0.0
+
+
+@dataclass
 class ProfileReport:
     """Always-on profile of an fpwap run. Target overhead: < 1% wall-clock.
 
@@ -72,6 +87,10 @@ class ProfileReport:
     total_wall_s: float = 0.0
     total_tokens: int = 0
     per_layer: dict[int, LayerTiming] = field(default_factory=dict)
+    setup: SetupTiming | None = None
+    embed_s: float = 0.0
+    loop_s: float = 0.0
+    teardown_s: float = 0.0
 
     def throughput_tok_per_s(self) -> float:
         """End-to-end tokens per second — total tokens (N * seq_len) divided
@@ -100,6 +119,19 @@ class ProfileReport:
             f"across {len(self.per_layer)} layers"
         )
         lines = [hdr]
+        if self.setup is not None:
+            s = self.setup
+            lines.append(
+                f"  setup {s.total_s:.3f}s  "
+                f"(resolve {s.resolve_s:.3f}s  config {s.config_s:.3f}s  "
+                f"model {s.model_s:.3f}s  index {s.index_s:.3f}s)"
+            )
+        if self.embed_s > 0:
+            lines.append(f"  embed {self.embed_s:.3f}s")
+        if self.loop_s > 0:
+            lines.append(f"  loop  {self.loop_s:.3f}s")
+        if self.teardown_s > 0:
+            lines.append(f"  teardown {self.teardown_s:.3f}s")
         for i, t in sorted(self.per_layer.items()):
             lines.append(
                 f"  layer {i}: load {t.load_s:.3f}s  fwd {t.forward_s:.3f}s  "
@@ -452,7 +484,7 @@ class Sweep:
                 blockers=["dataset is empty"],
             )
 
-        model, streamer = self._resolve_model_and_streamer()
+        model, streamer, _ = self._resolve_model_and_streamer()
         model.eval()
         plumbing = get_plumbing(model)
         exec_device = streamer.execution_device or items[0]["input_ids"].device
@@ -503,8 +535,10 @@ class Sweep:
             ),
         )
 
-    def _resolve_model_and_streamer(self) -> tuple[nn.Module, _LayerStreamer]:
-        """Turn `self.model` into (concrete nn.Module, streamer).
+    def _resolve_model_and_streamer(
+        self,
+    ) -> tuple[nn.Module, _LayerStreamer, SetupTiming | None]:
+        """Turn `self.model` into (concrete nn.Module, streamer, setup_timing).
 
         Pre-loaded nn.Module → _PreloadedStreamer (no-op per-layer).
         Pre-loaded nn.Module + _accel_index → _OffloadStreamer (Extractor reuse).
@@ -518,8 +552,8 @@ class Sweep:
                         "execution_device is required when using a pre-built accel_index "
                         "(Extractor path)"
                     )
-                return self.model, _OffloadStreamer(self._accel_index, self.execution_device)
-            return self.model, _PreloadedStreamer(self.execution_device)
+                return self.model, _OffloadStreamer(self._accel_index, self.execution_device), None
+            return self.model, _PreloadedStreamer(self.execution_device), None
         if isinstance(self.model, str):
             if self.execution_device is None:
                 raise ValueError(
@@ -529,17 +563,27 @@ class Sweep:
 
             from fpwap.loader import resolve_snapshot_dir
 
+            t0_resolve = time.perf_counter_ns()
             if self.snapshot_dir is not None:
                 snapshot_dir = Path(self.snapshot_dir)
             else:
                 snapshot_dir = resolve_snapshot_dir(self.model)
-            model, accel_index = build_empty_model_and_index(
+            resolve_s = (time.perf_counter_ns() - t0_resolve) / 1e9
+
+            model, accel_index, build_timing = build_empty_model_and_index(
                 model_id=self.model,
                 snapshot_dir=snapshot_dir,
                 dtype=self.transport_dtype,
             )
+            setup = SetupTiming(
+                resolve_s=resolve_s,
+                config_s=build_timing["config_s"],
+                model_s=build_timing["model_s"],
+                index_s=build_timing["index_s"],
+                total_s=resolve_s + sum(build_timing.values()),
+            )
             streamer = _OffloadStreamer(accel_index, self.execution_device)
-            return model, streamer
+            return model, streamer, setup
         got = type(self.model).__name__
         raise TypeError(
             f"model must be str (model ID / snapshot path) or nn.Module, got {got}"
@@ -552,7 +596,8 @@ class Sweep:
                 "would require running cpu_offload in parallel and isn't wired. "
                 "For streaming correctness, see tests/gpu/test_streaming_bit_exact.py."
             )
-        model, streamer = self._resolve_model_and_streamer()
+        t0_run = time.perf_counter_ns()
+        model, streamer, setup_timing = self._resolve_model_and_streamer()
         model.eval()  # fpwap is inference-only; dropout/etc. must be off.
         plumbing = get_plumbing(model)
 
@@ -639,7 +684,7 @@ class Sweep:
         for cb in self.callbacks:
             cb.on_sweep_start(ctx)
 
-        t0_run = time.perf_counter_ns()
+        t0_embed = time.perf_counter_ns()
 
         # Pass 0: embedding over the whole dataset. Contiguous write_slice
         # into the pinned CPU buffer goes through the CUDA copy engine.
@@ -655,6 +700,7 @@ class Sweep:
                     ).to(dtype=torch.int64)
         if exec_device.type == "cuda":
             torch.cuda.synchronize()
+        embed_s = (time.perf_counter_ns() - t0_embed) / 1e9
 
         # Which hooks do any callbacks care about? Drives whether to take the
         # fast-path (direct block forward) or decompose the block to expose
@@ -717,6 +763,7 @@ class Sweep:
         # microbatch loop. On first iteration, load sync.
         prefetch_future: Any | None = None
 
+        t0_loop = time.perf_counter_ns()
         for layer_idx in layer_iter:
             timing = LayerTiming()
             profile.per_layer[layer_idx] = timing
@@ -903,7 +950,10 @@ class Sweep:
                     model, layer_idx + 1, plumbing
                 )
 
+        loop_s = (time.perf_counter_ns() - t0_loop) / 1e9
+
         # Drain the prefetch pool so the worker thread exits cleanly.
+        t0_teardown = time.perf_counter_ns()
         streamer.close()
 
         artifacts: dict[tuple[str, int], Artifact] = dict(layer_artifacts)
@@ -912,10 +962,16 @@ class Sweep:
             if art is not None:
                 artifacts[(art.key.kind, art.key.layer_idx)] = art
 
-        profile.total_wall_s = (time.perf_counter_ns() - t0_run) / 1e9
-        profile.total_tokens = n_samples * self.seq_len
         if self.storage is not None:
             self.storage.on_sweep_end()
+        teardown_s = (time.perf_counter_ns() - t0_teardown) / 1e9
+
+        profile.total_wall_s = (time.perf_counter_ns() - t0_run) / 1e9
+        profile.total_tokens = n_samples * self.seq_len
+        profile.setup = setup_timing
+        profile.embed_s = embed_s
+        profile.loop_s = loop_s
+        profile.teardown_s = teardown_s
         return Result(
             sweep_id=sweep_id,
             artifacts=artifacts,

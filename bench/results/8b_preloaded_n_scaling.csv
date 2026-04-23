@@ -1,0 +1,5 @@
+model,mode,N,seq_len,microbatch,wall_s,tok_s,peak_gpu_mb,peak_cpu_mb,n_layers
+meta-llama/Llama-3.1-8B-Instruct,preloaded,8,256,8,0.36,5691.4,16314.5,5734.2,32
+meta-llama/Llama-3.1-8B-Instruct,preloaded,64,256,64,1.49,11003.9,18032.5,6362.8,32
+meta-llama/Llama-3.1-8B-Instruct,preloaded,512,256,128,11.83,11080.9,20802.8,6508.0,32
+meta-llama/Llama-3.1-8B-Instruct,preloaded,4096,256,128,96.78,10834.1,28333.7,11094.7,32

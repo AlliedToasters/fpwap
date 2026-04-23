@@ -1,0 +1,5 @@
+model,mode,N,seq_len,microbatch,wall_s,tok_s,peak_gpu_mb,peak_cpu_mb,n_layers
+meta-llama/Llama-3.3-70B-Instruct,streaming,8,256,8,102.07,20.1,4309.9,2965.8,80
+meta-llama/Llama-3.3-70B-Instruct,streaming,64,256,64,66.08,247.9,7730.8,3573.8,80
+meta-llama/Llama-3.3-70B-Instruct,streaming,512,256,128,163.34,802.4,13252.6,4088.2,80
+meta-llama/Llama-3.3-70B-Instruct,streaming,4096,256,128,884.97,1184.9,28299.7,20596.4,80
