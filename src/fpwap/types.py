@@ -27,7 +27,7 @@ BatchResult: TypeAlias = Emit | WriteBack | None
 
 @dataclass(frozen=True)
 class ArtifactKey:
-    fpwap_id: str
+    sweep_id: str
     layer_idx: int
     hook: HookName
     kind: str
@@ -40,14 +40,14 @@ class LayerArtifact:
 
 
 @dataclass
-class fpwapArtifact:
+class Artifact:
     key: ArtifactKey
     payload: Any
 
 
 @dataclass
-class fpwapContext:
-    fpwap_id: str
+class Context:
+    sweep_id: str
     n_samples: int
     seq_len: int
     hidden: int

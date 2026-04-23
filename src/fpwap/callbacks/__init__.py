@@ -1,3 +1,3 @@
-from fpwap.callbacks.base import fpwapCallback
+from fpwap.callbacks.base import Callback
 
-__all__ = ["fpwapCallback"]
+__all__ = ["Callback"]

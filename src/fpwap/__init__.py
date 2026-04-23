@@ -1,22 +1,22 @@
-from fpwap.callbacks.base import fpwapCallback
-from fpwap.engine import fpwap, fpwapResult
+from fpwap.callbacks.base import Callback
+from fpwap.engine import Result, Sweep
 from fpwap.types import (
+    Artifact,
     ArtifactKey,
+    Context,
     Emit,
     LayerArtifact,
     WriteBack,
-    fpwapArtifact,
-    fpwapContext,
 )
 
 __all__ = [
+    "Artifact",
     "ArtifactKey",
+    "Callback",
+    "Context",
     "Emit",
     "LayerArtifact",
+    "Result",
+    "Sweep",
     "WriteBack",
-    "fpwap",
-    "fpwapArtifact",
-    "fpwapCallback",
-    "fpwapContext",
-    "fpwapResult",
 ]

@@ -7,23 +7,23 @@ import torch
 from torch import Tensor
 
 from fpwap.types import (
+    Artifact,
     BatchResult,
+    Context,
     HookName,
     LayerArtifact,
     Phase,
-    fpwapArtifact,
-    fpwapContext,
 )
 
 
-class fpwapCallback:
+class Callback:
     target_layers: Sequence[int] | Literal["all"] = "all"
     target_hooks: Sequence[HookName] = ("residual_post",)
     phase: Phase = "read"
     needs_grad: bool = False
     accum_dtype: torch.dtype = torch.float32
 
-    def on_fpwap_start(self, ctx: fpwapContext) -> None:
+    def on_sweep_start(self, ctx: Context) -> None:
         return None
 
     def on_layer_start(self, layer_idx: int) -> None:
@@ -41,7 +41,7 @@ class fpwapCallback:
     def on_layer_end(self, layer_idx: int) -> LayerArtifact | None:
         return None
 
-    def on_fpwap_end(self) -> fpwapArtifact | None:
+    def on_sweep_end(self) -> Artifact | None:
         return None
 
     def checkpoint_state(self) -> bytes:

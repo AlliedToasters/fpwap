@@ -1,13 +1,10 @@
-"""GPU bit-perfect contract: fpwap vs. naive forward on CUDA.
+"""GPU execution, CPU-resident residual buffer.
 
-Per SPEC.md §14.2 and CLAUDE.md principle 2, every forward pass must match
-bit-for-bit (within bf16 tolerance) against a reference path running on the
-same weights, same dtype, same device.
+This is the topology that unlocks N_samples × seq × hidden bigger than VRAM
+(the whole point of cooking on a single consumer GPU). Fwd runs on CUDA,
+buffer is host RAM, transfers every microbatch.
 
-This test runs the core inverted loop on real CUDA hardware to catch GPU-only
-bugs the CPU integration tests can miss (bf16 matmul quirks, synchronization,
-per-device non-determinism). The streaming / cpu_offload comparison is
-separate — here we only care the loop itself is correct on-device.
+Must still match a naive CUDA forward bit-for-bit within bf16 tolerance.
 """
 from __future__ import annotations
 
@@ -23,8 +20,12 @@ N_HEAD = 4
 VOCAB = 128
 
 
-def _tiny_gpt2_cuda_bf16() -> torch.nn.Module:
+@pytest.mark.gpu
+def test_cpu_buffer_gpu_exec_matches_naive() -> None:
     from transformers import GPT2Config, GPT2LMHeadModel
+
+    from fpwap import Callback, Sweep
+    from fpwap.types import BatchResult, HookName
 
     config = GPT2Config(
         vocab_size=VOCAB,
@@ -36,15 +37,6 @@ def _tiny_gpt2_cuda_bf16() -> torch.nn.Module:
     torch.manual_seed(SEED)
     model = GPT2LMHeadModel(config).to(dtype=torch.bfloat16, device="cuda:0")
     model.eval()
-    return model
-
-
-@pytest.mark.gpu
-def test_residual_post_matches_naive_on_cuda_bf16() -> None:
-    from fpwap import Callback, Sweep
-    from fpwap.types import BatchResult, HookName
-
-    model = _tiny_gpt2_cuda_bf16()
 
     torch.manual_seed(SEED + 1)
     input_ids = torch.randint(0, VOCAB, (N_SAMPLES, SEQ_LEN), device="cuda:0")
@@ -53,8 +45,8 @@ def test_residual_post_matches_naive_on_cuda_bf16() -> None:
 
     def _make_hook(layer_idx: int):
         def hook(_mod, _inp, out):
-            hidden = out[0] if isinstance(out, tuple) else out
-            baseline[layer_idx] = hidden.detach().clone()
+            h = out[0] if isinstance(out, tuple) else out
+            baseline[layer_idx] = h.detach().clone()
 
         return hook
 
@@ -88,6 +80,7 @@ def test_residual_post_matches_naive_on_cuda_bf16() -> None:
             acts: torch.Tensor,
             sample_ids: torch.Tensor,
         ) -> BatchResult:
+            # sample_ids live on exec device (cuda)
             self.acts[layer_idx][sample_ids] = acts.detach()
             return None
 
@@ -98,17 +91,15 @@ def test_residual_post_matches_naive_on_cuda_bf16() -> None:
         seq_len=SEQ_LEN,
         callbacks=[cap],
         transport_dtype=torch.bfloat16,
+        microbatch_size=4,
+        buffer_device="cpu",  # KEY: buffer on host RAM
         seed=SEED,
     )
-    result = run.run()
+    run.run()
 
     for layer_idx, base in baseline.items():
         got = cap.acts[layer_idx]
         max_diff = (got.float() - base.float()).abs().max().item()
         assert torch.allclose(got, base, atol=5e-3, rtol=5e-3), (
-            f"residual_post mismatch at layer {layer_idx}: max abs diff {max_diff}"
+            f"CPU-buffer/GPU-exec mismatch at layer {layer_idx}: max abs diff {max_diff}"
         )
-
-    # Profile recorded per-layer timings even though streaming was a no-op
-    # (pre-loaded model path).
-    assert len(result.profile.per_layer) == N_LAYERS

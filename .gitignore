@@ -16,3 +16,4 @@ htmlcov/
 .vscode/
 .idea/
 CLAUDE.md
+.claude/

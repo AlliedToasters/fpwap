@@ -17,6 +17,7 @@ dependencies = [
     "transformers>=4.40",
     "pyarrow>=15.0",
     "numpy>=1.26",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
@@ -43,12 +44,18 @@ strict = true
 files = ["src/fpwap"]
 
 [[tool.mypy.overrides]]
-module = ["accelerate.*", "safetensors.*", "transformers.*", "pyarrow.*"]
+module = ["accelerate.*", "safetensors.*", "transformers.*", "pyarrow.*", "tqdm.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not gpu'"
+addopts = "-m 'not gpu and not integration'"
 markers = [
     "gpu: tests that require a local CUDA GPU (skipped in CI)",
+    "integration: forward-pass correctness tests (run locally, skipped in CI)",
+]
+filterwarnings = [
+    # HF's mask prep API is deprecated through Transformers v5.10; we use it
+    # deliberately for bit-match parity with GPT2Model.forward.
+    "ignore:The attention mask API under.*AttentionMaskConverter.*:FutureWarning",
 ]

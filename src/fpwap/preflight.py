@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from fpwap.callbacks.base import fpwapCallback
+from fpwap.callbacks.base import Callback
 from fpwap.types import LoadingStrategy
 
 
@@ -46,7 +46,7 @@ def plan(
     vram_budget_gb: float,
     nvme_free_gb: float,
     cpu_ram_gb: float,
-    callbacks: Sequence[fpwapCallback],
+    callbacks: Sequence[Callback],
     transport_dtype: torch.dtype = torch.bfloat16,
 ) -> PreflightReport:
     raise NotImplementedError

@@ -1,63 +1,35 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Protocol
 
 from torch import Tensor
 
-from fpwap.types import ArtifactKey, HookName, fpwapArtifact
-
-
-@dataclass
-class ActivationSchema:
-    shape: Sequence[int]
-    dtype: str
-
-
-@dataclass
-class ShardHandle:
-    path: str
-    schema: ActivationSchema
-
-
-@dataclass
-class ShardManifest:
-    path: str
-    n_rows: int
-    schema: ActivationSchema
+from fpwap.types import HookName
 
 
 class StorageBackend(Protocol):
-    def open_shard(
+    """Persist per-sample emits across a sweep.
+
+    Pragmatic shape: engine calls on_sweep_start once, write_emit per
+    microbatch that produces an Emit, and read_all when the user reaches for
+    `result.activations(layer, hook)`. on_sweep_end gives the backend a
+    chance to flush. Backends MAY lazily size their storage on first
+    write_emit (shape comes from the tensor itself).
+    """
+
+    def on_sweep_start(self, sweep_id: str, n_samples: int) -> None: ...
+
+    def write_emit(
         self,
-        fpwap_id: str,
         layer_idx: int,
         hook: HookName,
-        kind: str,
-        schema: ActivationSchema,
-    ) -> ShardHandle: ...
-
-    def write_rows(
-        self,
-        handle: ShardHandle,
-        rows: Tensor,
         sample_ids: Tensor,
+        tensor: Tensor,
     ) -> None: ...
 
-    def close_shard(self, handle: ShardHandle) -> ShardManifest: ...
+    def read_all(self, layer_idx: int, hook: HookName) -> Tensor: ...
 
-    def write_artifact(
-        self,
-        fpwap_id: str,
-        key: ArtifactKey,
-        artifact: fpwapArtifact,
-    ) -> None: ...
+    def on_sweep_end(self) -> None: ...
 
 
-__all__ = [
-    "ActivationSchema",
-    "ShardHandle",
-    "ShardManifest",
-    "StorageBackend",
-]
+__all__ = ["StorageBackend"]

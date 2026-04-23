@@ -65,10 +65,10 @@ The inner loop that fpwap is optimizing. On the reference machine, per layer, pe
 One verb. One callback class. One result.
 
 ```python
-from fpwap import fpwap
+from fpwap import Sweep
 from fpwap.callbacks.common import RawActivations, IncrementalPCA, DiffOfMeans
 
-run = fpwap(
+run = Sweep(
     model="meta-llama/Llama-3.1-70B",
     dataset=my_dataset,                # iterable of {"input_ids": ..., "label": ...}
     seq_len=256,
@@ -104,12 +104,12 @@ No off-by-one translation at the call site.
 
 ### Writing your own callback
 
-Subclass `fpwapCallback`. Declare which layers and hooks you want; implement `on_batch`. Return an `Emit` to persist a tensor, a `WriteBack` to modify the residual before the next layer, or `None` to no-op.
+Subclass `Callback`. Declare which layers and hooks you want; implement `on_batch`. Return an `Emit` to persist a tensor, a `WriteBack` to modify the residual before the next layer, or `None` to no-op.
 
 ```python
-from fpwap import fpwapCallback, Emit
+from fpwap import Callback, Emit
 
-class LastTokenLogNorm(fpwapCallback):
+class LastTokenLogNorm(Callback):
     target_layers = [32]
     target_hooks = ("residual_post",)
     phase = "read"
@@ -126,7 +126,7 @@ The same entry point handles steering. A callback with `phase = "write"` modifie
 from fpwap.callbacks.common import SteerInBasis
 
 # Pass 2: steer in the basis fit during pass 1
-steer = fpwap(
+steer = Sweep(
     model="meta-llama/Llama-3.1-70B",
     dataset=my_dataset,
     seq_len=256,
@@ -176,7 +176,7 @@ The recommended shape is a single classmethod on your codebase's activation-sour
 class Activations:
     @classmethod
     def from_fpwap(cls, model_id, prompts, layers, pool="last_token"):
-        run = fpwap(
+        run = Sweep(
             model=model_id,
             dataset=_as_dataset(prompts),
             seq_len=...,
@@ -198,6 +198,56 @@ fpwap is a plumbing layer. It produces activations and accepts transforms. It do
 
 ## Status
 
-Early skeleton — the engine is not yet implemented. The bit-perfect test at `tests/gpu/test_forward_bit_perfect.py` (fpwap vs. `accelerate.cpu_offload` residual match at every layer) is the definition of "done" for the first milestone.
+The engine is functional for the SPEC §17 hero path and beats the 950 tok/s
+streaming target. Measured on the reference machine (RTX 5090, 128 GB RAM,
+PCIe 5.0):
+
+| Model | Path | Samples × seq_len | Throughput (bf16) | SPEC target |
+| ----- | ---- | ------------------ | ----------------- | ----------- |
+| Llama-3.1-8B-Instruct | preloaded        | 256 × 128    | 11,894 tok/s | ≥ 5,000 |
+| Llama-3.1-8B-Instruct | streaming        | 256 × 128    |  7,071 tok/s | ≥ 5,000 |
+| Llama-3.3-70B-Instruct | streaming, CPU buf | 1024 × 128  |  1,026 tok/s | ≥ 950 |
+| Llama-3.3-70B-Instruct | streaming, CPU buf, prefetch | 10,000 × 128 | **1,221 tok/s** | ≥ 950 |
+
+The 10k × 128 hero number is end-to-end across 80 layers with a pinned-CPU
+residual buffer (21 GB), async D2H, and a worker-thread weight prefetch
+that overlaps layer L+1's safetensors read with layer L's compute.
+Pre-pin-memory this hit 741 tok/s — writes alone burned 17s per layer;
+with pinning they collapse to ~0s. Prefetch adds another few percent on
+hero (saves wait-on-load when load < forward) and ~25% on the 1024-sample
+microbench (where load dominated).
+
+Correctness: `tests/gpu/test_real_llama_bit_exact.py` runs Llama-3.2-1B in bf16
+on CUDA and compares every layer's `residual_post` against a naive HF forward —
+bit-exact (`torch.equal`) at every real token position. When microbatch_size
+equals the naive batch size, bf16 is deterministic; at different microbatch
+sizes, outputs diverge by LSB accumulation noise (see the memory note on
+`bf16_microbatch_determinism`).
+
+What's wired: pre-loaded and streaming model paths, `Sweep` + `Callback` +
+`Result` API, padded-batch + attention-mask propagation, RoPE-aware Llama
+plumbing, GPT-2 plumbing, all four hooks (`residual_pre`, `attn_out`,
+`mlp_out`, `residual_post`) with fast-path block forward when no sub-layer
+hook is wanted and WriteBack at every hook (sub-layer WriteBack is
+threaded through the block mid-forward so the modified tensor actually
+affects downstream compute), all four reference callbacks shipped
+(`RawActivations`, `IncrementalPCA`, `DiffOfMeans`, `SteerInBasis`),
+`result.activations(...)`, tqdm progress plus callable `progress=reporter`
+emitting `ProgressEvent`s for wandb/rich sinks, pinned-CPU
+`buffer_device="cpu"` with async D2H copy (so oversized residual buffers
+don't block compute), worker-thread **concurrent weight prefetch** on the
+streaming path (layer L+1's safetensors read + H2D overlap with layer L's
+compute), `MemmapBackend` for disk-backed emits,
+`ProfileReport.throughput_tok_per_s()` / `weight_bandwidth_gb_per_s()`,
+`verify=True` fail-fast against a naive-forward baseline (pre-loaded
+models), per-layer `on_layer_end` artifacts collected into
+`result.artifacts`.
+
+Model families covered by the structural matcher: Llama, Mistral, Qwen2,
+Gemma, and any future HF causal LM exposing the same `model.{embed_tokens,
+layers, rotary_emb}` layout. GPT-2 covered by its own plumbing.
+
+What's not yet: checkpoint/resume, NVMe-backed ResidualBuffer,
+`verify=True` on the streaming path (pre-loaded only).
 
 See `SPEC.md` for the full design.

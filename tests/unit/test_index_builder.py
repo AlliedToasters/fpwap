@@ -1,21 +1,15 @@
-"""Contract for build_accel_index_from_hf_cache (SPEC Appendix C).
-
-xfail-strict — the helper is NotImplementedError until the loader lands.
-This test is the red side of the red->green cycle for the loader milestone.
-"""
+"""Contract for build_accel_index_from_hf_cache (SPEC Appendix C)."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-import pytest
 import torch
 from safetensors.torch import save_file
 
 from fpwap.loader import build_accel_index_from_hf_cache
 
 
-@pytest.mark.xfail(strict=True, reason="loader not yet implemented")
 def test_build_index_from_tiny_snapshot(tmp_path: Path) -> None:
     shard = {
         "model.embed_tokens.weight": torch.zeros(4, 8, dtype=torch.bfloat16),
