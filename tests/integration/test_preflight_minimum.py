@@ -58,6 +58,13 @@ def test_preflight_reports_feasible() -> None:
     assert report.estimated_wall_clock_s > 0
     assert not report.blockers
 
+    assert report.prediction is not None
+    assert report.prediction.throughput_tok_s > 0
+    assert report.prediction.bottleneck in ("load", "compute", "balanced")
+    summary = report.summary()
+    assert "feasible" in summary
+    assert "tok/s" in summary
+
 
 @pytest.mark.integration
 def test_preflight_blocks_empty_dataset() -> None:

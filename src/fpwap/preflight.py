@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from fpwap.callbacks.base import Callback
+from fpwap.cost_model import CostModelPrediction
 from fpwap.types import LoadingStrategy
 
 
@@ -21,6 +22,56 @@ class PreflightReport:
     loading_strategy: LoadingStrategy
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    prediction: CostModelPrediction | None = None
+    recommended_buffer_device: str | None = None
+    recommended_prefetch: bool | None = None
+
+    def summary(self) -> str:
+        """Human-readable preflight summary with cost model predictions."""
+        lines: list[str] = []
+        status = "feasible" if self.feasible else "INFEASIBLE"
+        lines.append(f"{status} | microbatch_size={self.microbatch_size}")
+
+        if self.blockers:
+            for b in self.blockers:
+                lines.append(f"  BLOCKER: {b}")
+
+        if self.prediction is not None:
+            p = self.prediction
+            mins = p.total_wall_s / 60
+            if mins >= 1.0:
+                lines.append(
+                    f"predicted: {mins:.1f} min wall-clock, "
+                    f"{p.throughput_tok_s:,.0f} tok/s"
+                )
+            else:
+                lines.append(
+                    f"predicted: {p.total_wall_s:.1f}s wall-clock, "
+                    f"{p.throughput_tok_s:,.0f} tok/s"
+                )
+            lines.append(
+                f"bottleneck: {p.bottleneck} "
+                f"(load {p.load_pct:.0%}, compute {p.compute_pct:.0%})"
+            )
+            lines.append(f"weight I/O: {p.weight_io_gb:.1f} GB")
+        else:
+            lines.append(
+                f"estimated wall-clock: {self.estimated_wall_clock_s:.1f}s"
+            )
+            lines.append(f"weight I/O: {self.estimated_weight_io_gb:.1f} GB")
+
+        recs: list[str] = []
+        if self.recommended_buffer_device is not None:
+            recs.append(f"buffer_device={self.recommended_buffer_device!r}")
+        if self.recommended_prefetch is not None:
+            recs.append(f"prefetch={'on' if self.recommended_prefetch else 'off'}")
+        if recs:
+            lines.append(f"recommended: {', '.join(recs)}")
+
+        for w in self.warnings:
+            lines.append(f"  warning: {w}")
+
+        return "\n".join(lines)
 
 
 def _select_loading_strategy(
