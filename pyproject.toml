@@ -52,6 +52,7 @@ testpaths = ["tests"]
 addopts = "-m 'not gpu and not integration'"
 markers = [
     "gpu: tests that require a local CUDA GPU (skipped in CI)",
+    "gpu_large: real-checkpoint bit-exact tests (multi-GB downloads, opt-in via --run-gpu-large)",
     "integration: forward-pass correctness tests (run locally, skipped in CI)",
 ]
 filterwarnings = [
