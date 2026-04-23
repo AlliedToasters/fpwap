@@ -758,9 +758,9 @@ class Sweep:
                 )
             )
 
-        # Prefetch: a future for the NEXT layer's load, submitted at the end
-        # of the current layer so it runs in parallel with this layer's
-        # microbatch loop. On first iteration, load sync.
+        # Prefetch: a future for the NEXT layer's load, submitted right
+        # after the current layer loads so it overlaps with the microbatch
+        # compute. On first iteration, load sync.
         prefetch_future: Any | None = None
 
         t0_loop = time.perf_counter_ns()
@@ -783,6 +783,15 @@ class Sweep:
                 streamer.load_layer(model, layer_idx, plumbing)
             timing.load_s += (time.perf_counter_ns() - t_load) / 1e9
             timing.bytes_weights += streamer.last_load_bytes
+
+            # Submit prefetch for the next layer immediately so safetensors
+            # read + H2D overlaps with this layer's microbatch compute.
+            # Two layers coexist on GPU briefly until the current layer is
+            # unloaded at the end of the loop body.
+            if layer_idx + 1 < n_layers:
+                prefetch_future = streamer.prefetch_load(
+                    model, layer_idx + 1, plumbing
+                )
 
             for cb in self.callbacks:
                 cb.on_layer_start(layer_idx)
@@ -935,20 +944,6 @@ class Sweep:
                     )
 
             streamer.unload_layer(model, layer_idx, plumbing)
-
-            # Kick off prefetch of the next layer right after unload, so the
-            # worker starts its safetensors read while the next iteration's
-            # end-of-layer synchronization (from cuda.synchronize above) has
-            # just drained the main stream. This overlaps worker I/O with
-            # Python-side accounting on the main thread; empirically the
-            # submit-after-unload placement beats submit-before-fwd on the
-            # 1024 × 128 bench (see earlier v2 measurement) — possibly
-            # because moving the submit earlier causes some contention on
-            # the CUDA driver lock with the main stream's kernel launches.
-            if layer_idx + 1 < n_layers:
-                prefetch_future = streamer.prefetch_load(
-                    model, layer_idx + 1, plumbing
-                )
 
         loop_s = (time.perf_counter_ns() - t0_loop) / 1e9
 
