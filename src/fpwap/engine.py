@@ -435,7 +435,7 @@ def _build_bucketed_segments(
     left_padded = _detect_left_padding(items)
 
     bucket_assign: dict[int, list[tuple[int, Any]]] = {}
-    for orig_idx, (item, rl) in enumerate(zip(items, real_lengths)):
+    for orig_idx, (item, rl) in enumerate(zip(items, real_lengths, strict=True)):
         bseq = min(_next_power_of_2(max(rl, 16)), max_seq_len)
         bucket_assign.setdefault(bseq, []).append((orig_idx, item))
 

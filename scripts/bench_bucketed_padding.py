@@ -143,7 +143,7 @@ def main():
     speedup = wall_fixed / wall_bucketed if wall_bucketed > 0 else float("inf")
     token_reduction = 1.0 - prof_bucketed.total_tokens / prof_fixed.total_tokens
     print(f"\n{'='*60}")
-    print(f"  Summary")
+    print("  Summary")
     print(f"{'='*60}")
     print(f"  speedup:          {speedup:.2f}×")
     print(f"  token reduction:  {token_reduction*100:.1f}%")

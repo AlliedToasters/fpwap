@@ -97,7 +97,7 @@ def test_bucketed_padding_basic() -> None:
         padding="bucketed",
         apply_final_norm=False,
     )
-    result = sweep.run()
+    sweep.run()
 
     for i in range(N_SAMPLES):
         assert i in cap.per_sample, f"sample {i} missing from output"
@@ -173,10 +173,10 @@ def test_bucketed_matches_per_bucket_naive() -> None:
         # Naive HF forward on the trimmed input
         captures: dict[int, torch.Tensor] = {}
 
-        def _make_hook(layer_idx: int):
+        def _make_hook(layer_idx: int, _cap: dict = captures):  # noqa: B006
             def hook(_mod, _inp, out):
                 hidden = out[0] if isinstance(out, tuple) else out
-                captures[layer_idx] = hidden.detach().clone()
+                _cap[layer_idx] = hidden.detach().clone()
 
             return hook
 

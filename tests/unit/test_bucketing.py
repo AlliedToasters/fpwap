@@ -4,7 +4,6 @@ from __future__ import annotations
 import torch
 
 
-
 def test_next_power_of_2() -> None:
     from fpwap.engine import _next_power_of_2
 
