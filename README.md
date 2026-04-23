@@ -196,6 +196,10 @@ Branch `use_fpwap` at your dispatch layer — the same place you'd branch betwee
 
 fpwap is a plumbing layer. It produces activations and accepts transforms. It does not know what a probe is. Linear probe fitting, SAE training, attribution analysis, and any other statistical modeling of activations belong in consumer libraries. If it requires knowing what a probe is, it's out of scope.
 
+## Related work
+
+The loop inversion at the heart of fpwap — load each layer once, stream the dataset through it — was explored independently by [FlexGen](https://arxiv.org/abs/2303.06865) (Sheng et al., ICML 2023) for high-throughput generative inference on a single GPU. FlexGen calls this a "zig-zag block schedule" and proves it is within 2× of I/O-optimal (Theorem 4.1) — a result that applies directly to fpwap's loop, since our schedule is the same modulo KV cache. FlexGen solves a harder scheduling problem (KV cache placement across GPU/CPU/disk, multi-step autoregressive decoding, CPU compute delegation) and applies 4-bit group-wise quantization to further compress weights. fpwap targets a narrower regime — forward-pass activation extraction for mechanistic interpretability — where full precision is non-negotiable and generation is not needed, so the implementation is much simpler. The absence of KV cache and autoregressive decoding also means fpwap's cost model has fewer free variables, making strategy selection tractable without an LP solver.
+
 ## Status
 
 **Llama-3.3-70B on a single RTX 5090 (32 GB VRAM), 10,000 prompts × 128
