@@ -206,8 +206,16 @@ PCIe 5.0):
 | ----- | ---- | ------------------ | ----------------- | ----------- |
 | Llama-3.1-8B-Instruct | preloaded        | 256 × 128    | 11,894 tok/s | ≥ 5,000 |
 | Llama-3.1-8B-Instruct | streaming        | 256 × 128    |  7,071 tok/s | ≥ 5,000 |
+| Llama-3.1-8B-Instruct | streaming        | 1024 × 128   | 10,442 tok/s | ≥ 5,000 |
+| Llama-3.1-8B-Instruct | _naive cpu_offload baseline_ | 1024 × 128 | _1,440 tok/s_ | _reference_ |
 | Llama-3.3-70B-Instruct | streaming, CPU buf | 1024 × 128  |  1,026 tok/s | ≥ 950 |
 | Llama-3.3-70B-Instruct | streaming, CPU buf, prefetch | 10,000 × 128 | **1,221 tok/s** | ≥ 950 |
+
+The 8B streaming-vs-naive head-to-head is a **7.25× speedup** at 1024 × 128
+(SPEC §17 ratio target is ≥ 4×). The naive row is `accelerate.cpu_offload`,
+reproducible via `scripts/benchmark.py --mode naive`. 70B isn't ratio-tested
+on this machine because the full bf16 model (~141 GB) exceeds 128 GB RAM
+for `cpu_offload`; on this hardware the 70B claim is absolute throughput.
 
 The 10k × 128 hero number is end-to-end across 80 layers with a pinned-CPU
 residual buffer (21 GB), async D2H, and a worker-thread weight prefetch
