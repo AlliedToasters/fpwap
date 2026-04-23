@@ -7,9 +7,9 @@ from fpwap.buffer import ResidualBuffer
 
 
 def test_cpu_buffer_is_pinned() -> None:
+    if not torch.cuda.is_available():
+        return
     buf = ResidualBuffer(n_samples=4, seq_len=2, hidden=3, dtype=torch.float32, device="cpu")
-    # Accessible as an attribute on the underlying storage; `is_pinned()`
-    # returns True once the OS has page-locked the allocation.
     assert buf._data.is_pinned()
 
 

@@ -606,7 +606,7 @@ class Sweep:
         # attention_mask, else None. Stored once; reused every layer so the
         # 2D→additive conversion happens inside layer_forward per microbatch.
         has_mask = _has_attention_mask(items)
-        mask_pin = buf_device.type == "cpu"
+        mask_pin = buf_device.type == "cpu" and torch.cuda.is_available()
         mask_buffer: Tensor | None = (
             torch.zeros(
                 (n_samples, self.seq_len),
