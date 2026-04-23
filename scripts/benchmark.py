@@ -11,9 +11,15 @@ Usage:
     uv run scripts/benchmark.py --model meta-llama/Llama-3.1-8B-Instruct \\
         --n-samples 512 --seq-len 128 --mode streaming
 
+    uv run scripts/benchmark.py --model meta-llama/Llama-3.1-8B-Instruct \\
+        --n-samples 512 --seq-len 128 --mode naive
+
 Modes:
     preloaded  — model fits on GPU; fpwap loop runs without weight streaming
     streaming  — model mmap'd from HF cache; per-layer load/unload each sweep
+    naive      — accelerate.cpu_offload baseline; weights streamed per-forward
+                 via AlignDevicesHook. The SPEC §17 reference point that fpwap
+                 beats by ≥4× at hero scale.
 """
 from __future__ import annotations
 
@@ -86,6 +92,81 @@ def _build_synthetic_dataset(
     ]
 
 
+def _run_naive(
+    snapshot_dir: Path,
+    dataset: list[dict[str, torch.Tensor]],
+    dtype: torch.dtype,
+    device: torch.device,
+    microbatch: int,
+) -> tuple[float, int, int]:
+    """accelerate.cpu_offload baseline (SPEC §17 reference point).
+
+    Loads the model onto CPU, installs AlignDevicesHooks so weights stream
+    onto `device` per-forward, then walks the dataset in microbatches.
+    Forward hooks on each transformer block force a residual touch so the
+    shape of the work matches fpwap's NullCapture (otherwise a layer-only
+    baseline would be unfairly cheap — no per-layer activation egress).
+
+    Returns (wall_time_seconds, total_tokens, n_layers).
+    """
+    from accelerate import cpu_offload
+
+    model = AutoModelForCausalLM.from_pretrained(
+        snapshot_dir, dtype=dtype, low_cpu_mem_usage=True
+    )
+    model.eval()
+
+    # Find transformer blocks structurally — same discipline as fpwap's plumbing.
+    inner = getattr(model, "model", None) or getattr(model, "transformer", None)
+    blocks = getattr(inner, "layers", None) or getattr(inner, "h", None)
+    if blocks is None:
+        raise RuntimeError("could not locate transformer blocks on this model")
+
+    touches = [0] * len(blocks)
+
+    def make_hook(i: int):
+        def _h(_m, _inp, out):
+            t = out[0] if isinstance(out, tuple) else out
+            touches[i] += int(t.shape[0])
+
+        return _h
+
+    handles = [b.register_forward_hook(make_hook(i)) for i, b in enumerate(blocks)]
+
+    model = cpu_offload(model, execution_device=device)
+
+    n_samples = len(dataset)
+    seq_len = int(dataset[0]["input_ids"].shape[-1])
+    total_tokens = n_samples * seq_len
+
+    has_mask = "attention_mask" in dataset[0]
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    try:
+        with torch.no_grad():
+            for start in range(0, n_samples, microbatch):
+                stop = min(start + microbatch, n_samples)
+                input_ids = torch.cat(
+                    [dataset[i]["input_ids"] for i in range(start, stop)], dim=0
+                ).to(device)
+                kwargs: dict[str, torch.Tensor] = {"input_ids": input_ids}
+                if has_mask:
+                    kwargs["attention_mask"] = torch.cat(
+                        [dataset[i]["attention_mask"] for i in range(start, stop)],
+                        dim=0,
+                    ).to(device)
+                model(**kwargs)
+    finally:
+        for h in handles:
+            h.remove()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    wall_s = time.perf_counter() - t0
+    return wall_s, total_tokens, len(blocks)
+
+
 def _resolve_snapshot_dir(model_id: str) -> Path:
     """Return an on-disk path for the model. Uses HF cache if present; does
     not download. Accepts either an HF hub id or an absolute path."""
@@ -103,9 +184,12 @@ def main() -> None:
     parser.add_argument("--microbatch", type=int, default=None)
     parser.add_argument(
         "--mode",
-        choices=["preloaded", "streaming"],
+        choices=["preloaded", "streaming", "naive"],
         default="streaming",
-        help="preloaded = full model on GPU; streaming = per-layer mmap load/unload",
+        help=(
+            "preloaded = full model on GPU; streaming = per-layer mmap "
+            "load/unload; naive = accelerate.cpu_offload (SPEC §17 baseline)"
+        ),
     )
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
@@ -122,6 +206,27 @@ def main() -> None:
     snapshot_dir = _resolve_snapshot_dir(args.model)
     tokenizer = AutoTokenizer.from_pretrained(snapshot_dir)
     dataset = _build_synthetic_dataset(tokenizer, args.n_samples, args.seq_len, device)
+
+    if args.mode == "naive":
+        mb = args.microbatch if args.microbatch is not None else 1
+        print(f"[benchmark] naive cpu_offload: {args.model} from {snapshot_dir}")
+        wall_s, total_tokens, n_layers = _run_naive(
+            snapshot_dir, dataset, dtype, device, mb
+        )
+        throughput = total_tokens / wall_s
+        print()
+        print(f"=== benchmark: {args.model} (naive/cpu_offload) ===")
+        print(f"  samples         : {args.n_samples}")
+        print(f"  seq_len         : {args.seq_len}")
+        print(f"  microbatch      : {mb}")
+        print(f"  dtype           : {args.dtype}")
+        print(f"  total tokens    : {total_tokens:,}")
+        print(f"  wall time       : {wall_s:.2f} s")
+        print(f"  throughput      : {throughput:,.1f} tok/s")
+        print(f"  layers          : {n_layers}")
+        print()
+        print("Compare against fpwap: fpwap_tok_s / this_tok_s should be >= 4 at hero scale.")
+        return
 
     if args.mode == "preloaded":
         print(f"[benchmark] pre-loading {args.model} onto {device} as {args.dtype}")
