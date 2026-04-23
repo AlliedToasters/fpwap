@@ -10,6 +10,8 @@ from torch import Tensor, nn
 class GPT2Plumbing:
     """Hook plumbing for HuggingFace GPT-2 family (`GPT2LMHeadModel`, `GPT2Model`)."""
 
+    uses_learned_positions: bool = True
+
     def matches(self, model: nn.Module) -> bool:
         transformer = getattr(model, "transformer", None)
         return transformer is not None and hasattr(transformer, "h") and hasattr(transformer, "wte")

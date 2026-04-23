@@ -22,6 +22,8 @@ class LlamaPlumbing:
     on top of the standard hidden_states + attention_mask signature.
     """
 
+    uses_learned_positions: bool = False
+
     def matches(self, model: nn.Module) -> bool:
         inner = getattr(model, "model", None)
         return (

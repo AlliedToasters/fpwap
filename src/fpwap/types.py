@@ -8,6 +8,7 @@ from torch import Tensor
 
 HookName = Literal["residual_pre", "residual_post", "attn_out", "mlp_out"]
 LoadingStrategy = Literal["cpu_offload", "disk_offload", "mmap_from_cache"]
+PaddingMode = Literal["fixed", "bucketed"]
 Phase = Literal["read", "write", "read_after_write"]
 
 

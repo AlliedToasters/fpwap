@@ -27,6 +27,7 @@ from fpwap.types import (
     Emit,
     HookName,
     LoadingStrategy,
+    PaddingMode,
     WriteBack,
 )
 
@@ -355,6 +356,130 @@ def _stack_field(items: list[Any], key: str) -> Tensor:
     return torch.cat(parts, dim=0)
 
 
+@dataclass
+class _Segment:
+    """A group of items with the same padded seq_len for the engine loop."""
+
+    seq_len: int
+    items: list[Any]
+    orig_indices: list[int]
+    buffer: ResidualBuffer
+    mask_buffer: Tensor | None
+    mb_size: int
+
+    @property
+    def n_samples(self) -> int:
+        return len(self.items)
+
+
+def _next_power_of_2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _detect_left_padding(items: list[Any]) -> bool:
+    for item in items:
+        mask = item["attention_mask"]
+        if isinstance(mask, Tensor):
+            if mask.dim() == 2:
+                mask = mask.squeeze(0)
+            real_len = int(mask.sum().item())
+            if real_len < mask.shape[0]:
+                return int(mask[0].item()) == 0
+    return True
+
+
+def _trim_to_length(item: dict[str, Any], target_len: int, left_padded: bool) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, val in item.items():
+        if key not in ("input_ids", "attention_mask") or not isinstance(val, Tensor):
+            result[key] = val
+            continue
+        t = val
+        was_2d = t.dim() == 2
+        if was_2d:
+            t = t.squeeze(0)
+        cur = t.shape[0]
+        if cur > target_len:
+            t = t[-target_len:] if left_padded else t[:target_len]
+        elif cur < target_len:
+            pad = torch.zeros(target_len - cur, dtype=t.dtype, device=t.device)
+            t = torch.cat([pad, t]) if left_padded else torch.cat([t, pad])
+        if was_2d:
+            t = t.unsqueeze(0)
+        result[key] = t
+    return result
+
+
+def _build_bucketed_segments(
+    items: list[Any],
+    max_seq_len: int,
+    hidden: int,
+    transport_dtype: torch.dtype,
+    buf_device: torch.device,
+    mb_size_override: int | None,
+    config: Any,
+    exec_device: torch.device,
+) -> list[_Segment]:
+    real_lengths: list[int] = []
+    for item in items:
+        mask = item["attention_mask"]
+        if isinstance(mask, Tensor):
+            if mask.dim() == 2:
+                mask = mask.squeeze(0)
+            real_lengths.append(int(mask.sum().item()))
+        else:
+            real_lengths.append(max_seq_len)
+
+    left_padded = _detect_left_padding(items)
+
+    bucket_assign: dict[int, list[tuple[int, Any]]] = {}
+    for orig_idx, (item, rl) in enumerate(zip(items, real_lengths, strict=True)):
+        bseq = min(_next_power_of_2(max(rl, 16)), max_seq_len)
+        bucket_assign.setdefault(bseq, []).append((orig_idx, item))
+
+    segments: list[_Segment] = []
+    for bseq in sorted(bucket_assign.keys()):
+        entries = bucket_assign[bseq]
+        orig_indices = [e[0] for e in entries]
+        trimmed_items = [_trim_to_length(e[1], bseq, left_padded) for e in entries]
+        n = len(trimmed_items)
+
+        buf = ResidualBuffer(n, bseq, hidden, transport_dtype, buf_device)
+        pin = buf_device.type == "cpu" and torch.cuda.is_available()
+        mask_buf = torch.zeros(
+            (n, bseq), dtype=torch.int64, device=buf_device, pin_memory=pin,
+        )
+
+        if mb_size_override is not None:
+            seg_mb = mb_size_override
+        else:
+            if isinstance(buf_device, torch.device):
+                buf_on_gpu = buf_device.type == "cuda"
+            else:
+                buf_on_gpu = "cuda" in str(buf_device)
+            seg_mb = estimate_max_microbatch(
+                config=config,
+                n_samples=n,
+                seq_len=bseq,
+                transport_dtype=transport_dtype,
+                exec_device=exec_device,
+                buf_on_gpu=buf_on_gpu,
+            )
+
+        segments.append(_Segment(
+            seq_len=bseq,
+            items=trimmed_items,
+            orig_indices=orig_indices,
+            buffer=buf,
+            mask_buffer=mask_buf,
+            mb_size=seg_mb,
+        ))
+
+    return segments
+
+
 def _run_naive_baseline(
     model: nn.Module,
     plumbing: ModelPlumbing,
@@ -493,6 +618,7 @@ class Sweep:
         execution_device: torch.device | str | None = None,
         buffer_device: torch.device | str | None = None,
         apply_final_norm: bool = True,
+        padding: PaddingMode = "fixed",
         _accel_index: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.model = model
@@ -509,6 +635,7 @@ class Sweep:
         self.snapshot_dir = snapshot_dir
         self.offload_dir = offload_dir
         self.apply_final_norm = apply_final_norm
+        self.padding: PaddingMode = padding
         self._accel_index = _accel_index
         self.execution_device = (
             torch.device(execution_device) if execution_device is not None else None
@@ -673,6 +800,13 @@ class Sweep:
                 "would require running cpu_offload in parallel and isn't wired. "
                 "For streaming correctness, see tests/gpu/test_streaming_bit_exact.py."
             )
+        if self.verify and self.padding == "bucketed":
+            raise NotImplementedError(
+                "verify=True is not supported with padding='bucketed'. "
+                "Bucketed padding uses per-bucket seq_len which changes the "
+                "naive baseline shape. Use the dedicated bucketed correctness "
+                "tests instead."
+            )
         t0_run = time.perf_counter_ns()
         model, streamer, setup_timing = self._resolve_model_and_streamer()
         model.eval()  # fpwap is inference-only; dropout/etc. must be off.
@@ -747,29 +881,62 @@ class Sweep:
             hidden=hidden,
             transport_dtype=self.transport_dtype,
         )
-        buffer = ResidualBuffer(
-            n_samples=n_samples,
-            seq_len=self.seq_len,
-            hidden=hidden,
-            dtype=self.transport_dtype,
-            device=buf_device,
-        )
 
-        # Optional parallel mask buffer: (N, seq) int8 when any item carries
-        # attention_mask, else None. Stored once; reused every layer so the
-        # 2D→additive conversion happens inside layer_forward per microbatch.
         has_mask = _has_attention_mask(items)
-        mask_pin = buf_device.type == "cpu" and torch.cuda.is_available()
-        mask_buffer: Tensor | None = (
-            torch.zeros(
-                (n_samples, self.seq_len),
-                dtype=torch.int64,
-                device=buf_device,
-                pin_memory=mask_pin,
+
+        # Build segments: one per bucket in bucketed mode, one total in fixed.
+        if self.padding == "bucketed":
+            if not has_mask:
+                raise ValueError(
+                    "padding='bucketed' requires attention_mask on all dataset "
+                    "items to determine real sequence lengths. Either add "
+                    "attention_mask or use padding='fixed'."
+                )
+            if plumbing.uses_learned_positions:
+                import warnings
+
+                warnings.warn(
+                    "padding='bucketed' with learned positional embeddings "
+                    f"({type(plumbing).__name__}): real tokens receive different "
+                    "position IDs than with padding='fixed'. Outputs will differ "
+                    "from fixed padding at positions where the bucket seq_len "
+                    "differs from the original seq_len. For RoPE models (Llama, "
+                    "Mistral), this is not an issue.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            mb_override: int | None = None if self.microbatch_size == "auto" else mb_size
+            segments = _build_bucketed_segments(
+                items, self.seq_len, hidden, self.transport_dtype,
+                buf_device, mb_override, config, exec_device,
             )
-            if has_mask
-            else None
-        )
+        else:
+            buffer = ResidualBuffer(
+                n_samples=n_samples,
+                seq_len=self.seq_len,
+                hidden=hidden,
+                dtype=self.transport_dtype,
+                device=buf_device,
+            )
+            mask_pin = buf_device.type == "cpu" and torch.cuda.is_available()
+            mask_buffer: Tensor | None = (
+                torch.zeros(
+                    (n_samples, self.seq_len),
+                    dtype=torch.int64,
+                    device=buf_device,
+                    pin_memory=mask_pin,
+                )
+                if has_mask
+                else None
+            )
+            segments = [_Segment(
+                seq_len=self.seq_len,
+                items=items,
+                orig_indices=list(range(n_samples)),
+                buffer=buffer,
+                mask_buffer=mask_buffer,
+                mb_size=mb_size,
+            )]
 
         # Emit sink: storage backend (disk) if wired, else in-memory.
         emits_sink: dict[tuple[int, str], list[tuple[Tensor, Tensor]]] = {}
@@ -787,15 +954,18 @@ class Sweep:
         # Pass 0: embedding over the whole dataset. Contiguous write_slice
         # into the pinned CPU buffer goes through the CUDA copy engine.
         with torch.no_grad():
-            for start in range(0, n_samples, mb_size):
-                stop = min(start + mb_size, n_samples)
-                input_ids = _stack_field(items[start:stop], "input_ids").to(exec_device)
-                embedded = plumbing.embed(model, input_ids)
-                buffer.write_slice(start, stop, embedded)
-                if mask_buffer is not None:
-                    mask_buffer[start:stop] = _stack_field(
-                        items[start:stop], "attention_mask"
-                    ).to(dtype=torch.int64)
+            for seg in segments:
+                for start in range(0, seg.n_samples, seg.mb_size):
+                    stop = min(start + seg.mb_size, seg.n_samples)
+                    input_ids = _stack_field(
+                        seg.items[start:stop], "input_ids"
+                    ).to(exec_device)
+                    embedded = plumbing.embed(model, input_ids)
+                    seg.buffer.write_slice(start, stop, embedded)
+                    if seg.mask_buffer is not None:
+                        seg.mask_buffer[start:stop] = _stack_field(
+                            seg.items[start:stop], "attention_mask"
+                        ).to(dtype=torch.int64)
         if exec_device.type == "cuda":
             torch.cuda.synchronize()
         embed_s = (time.perf_counter_ns() - t0_embed) / 1e9
@@ -894,127 +1064,124 @@ class Sweep:
             for cb in self.callbacks:
                 cb.on_layer_start(layer_idx)
 
-            n_batches = (n_samples + mb_size - 1) // mb_size
+            n_batches = sum(
+                (seg.n_samples + seg.mb_size - 1) // seg.mb_size
+                for seg in segments
+            )
             _emit_progress("layer_start", layer_idx, 0, n_batches)
             block = layer_modules[layer_idx]
-            for start in range(0, n_samples, mb_size):
-                stop = min(start + mb_size, n_samples)
-                sample_ids_exec = torch.arange(start, stop, device=exec_device)
+            batch_counter = 0
+            for seg in segments:
+                for start in range(0, seg.n_samples, seg.mb_size):
+                    stop = min(start + seg.mb_size, seg.n_samples)
+                    sample_ids_exec = torch.tensor(
+                        seg.orig_indices[start:stop],
+                        device=exec_device,
+                        dtype=torch.long,
+                    )
 
-                t_fwd = time.perf_counter_ns()
-                with torch.no_grad():
-                    # Contiguous slice reads exploit the pinned CPU buffer for
-                    # async H2D; index reads (buffer[tensor]) would allocate a
-                    # non-pinned intermediate and block the transfer.
-                    hidden_states = buffer.read_slice(start, stop).to(
-                        exec_device, non_blocking=True
-                    )
-                    mb_mask = (
-                        mask_buffer[start:stop].to(exec_device, non_blocking=True)
-                        if mask_buffer is not None
-                        else None
-                    )
-                    if dispatch_residual_pre:
-                        hidden_states = self._dispatch_callbacks(
-                            layer_idx,
-                            "residual_pre",
+                    t_fwd = time.perf_counter_ns()
+                    with torch.no_grad():
+                        hidden_states = seg.buffer.read_slice(start, stop).to(
+                            exec_device, non_blocking=True
+                        )
+                        mb_mask = (
+                            seg.mask_buffer[start:stop].to(
+                                exec_device, non_blocking=True
+                            )
+                            if seg.mask_buffer is not None
+                            else None
+                        )
+                        if dispatch_residual_pre:
+                            hidden_states = self._dispatch_callbacks(
+                                layer_idx,
+                                "residual_pre",
+                                hidden_states,
+                                sample_ids_exec,
+                                emits_sink=emits_sink,
+                            )
+                        inline_dispatch = None
+                        if needs_inline_sublayer_dispatch:
+                            def _inline(
+                                hook_name: str,
+                                tensor: Tensor,
+                                _layer_idx: int = layer_idx,
+                                _sample_ids: Tensor = sample_ids_exec,
+                            ) -> Tensor:
+                                return self._dispatch_callbacks(
+                                    _layer_idx,
+                                    hook_name,  # type: ignore[arg-type]
+                                    tensor,
+                                    _sample_ids,
+                                    emits_sink=emits_sink,
+                                    write_allowed=True,
+                                )
+
+                            inline_dispatch = _inline
+
+                        hidden_states, extras = plumbing.layer_forward_with_hooks(
+                            model,
+                            block,
                             hidden_states,
+                            attention_mask=mb_mask,
+                            wanted_hooks=sub_hooks,
+                            dispatch_fn=inline_dispatch,
+                        )
+                    timing.forward_s += (time.perf_counter_ns() - t_fwd) / 1e9
+
+                    if final_norm is not None and layer_idx == n_layers - 1:
+                        hidden_states = final_norm(hidden_states)
+
+                    t_cb = time.perf_counter_ns()
+                    for sub_hook, sub_tensor in extras.items():
+                        self._dispatch_callbacks(
+                            layer_idx,
+                            sub_hook,  # type: ignore[arg-type]
+                            sub_tensor,
                             sample_ids_exec,
                             emits_sink=emits_sink,
+                            write_allowed=False,
                         )
-                    inline_dispatch = None
-                    if needs_inline_sublayer_dispatch:
-                        # Bind this microbatch's identifiers via default args
-                        # so the closure doesn't pick up later iterations'
-                        # values. Called synchronously inside plumbing for
-                        # each sub-layer hook that has callbacks wired.
-                        def _inline(
-                            hook_name: str,
-                            tensor: Tensor,
-                            _layer_idx: int = layer_idx,
-                            _sample_ids: Tensor = sample_ids_exec,
-                        ) -> Tensor:
-                            return self._dispatch_callbacks(
-                                _layer_idx,
-                                hook_name,  # type: ignore[arg-type]
-                                tensor,
-                                _sample_ids,
-                                emits_sink=emits_sink,
-                                write_allowed=True,
-                            )
-
-                        inline_dispatch = _inline
-
-                    hidden_states, extras = plumbing.layer_forward_with_hooks(
-                        model,
-                        block,
-                        hidden_states,
-                        attention_mask=mb_mask,
-                        wanted_hooks=sub_hooks,
-                        dispatch_fn=inline_dispatch,
-                    )
-                timing.forward_s += (time.perf_counter_ns() - t_fwd) / 1e9
-
-                # Last layer + apply_final_norm: apply the model's final
-                # layernorm so residual_post matches HF's output_hidden_states.
-                if final_norm is not None and layer_idx == n_layers - 1:
-                    hidden_states = final_norm(hidden_states)
-
-                t_cb = time.perf_counter_ns()
-                # Sub-layer extras that the plumbing didn't dispatch inline
-                # (pure-read case) go here as read-only. When inline dispatch
-                # was active, extras is empty by construction.
-                for sub_hook, sub_tensor in extras.items():
-                    self._dispatch_callbacks(
+                    hidden_states = self._dispatch_callbacks(
                         layer_idx,
-                        sub_hook,  # type: ignore[arg-type]
-                        sub_tensor,
+                        "residual_post",
+                        hidden_states,
                         sample_ids_exec,
                         emits_sink=emits_sink,
-                        write_allowed=False,
                     )
-                hidden_states = self._dispatch_callbacks(
-                    layer_idx,
-                    "residual_post",
-                    hidden_states,
-                    sample_ids_exec,
-                    emits_sink=emits_sink,
-                )
-                if verify_baseline is not None:
-                    expected = verify_baseline[layer_idx][start:stop].to(
-                        device=hidden_states.device, dtype=hidden_states.dtype
-                    )
-                    # On padded datasets, the pad positions are "don't care"
-                    # (HF's own output there is undefined); compare only at
-                    # real tokens, like tests/integration/test_padded_batch.py.
-                    if mb_mask is not None:
-                        m = mb_mask.bool().unsqueeze(-1)
-                        got_real = hidden_states.masked_select(m)
-                        exp_real = expected.masked_select(m)
-                        ok = torch.equal(got_real, exp_real)
-                    else:
-                        ok = torch.equal(hidden_states, expected)
-                    if not ok:
-                        diff = (hidden_states.float() - expected.float()).abs().max().item()
-                        raise RuntimeError(
-                            f"verify: layer {layer_idx} microbatch [{start}:{stop}] "
-                            f"diverged from naive baseline (max abs diff {diff}). "
-                            f"For bf16 this usually means microbatch_size != dataset size "
-                            f"(see bf16_microbatch_determinism); for fp32 it indicates "
-                            f"a plumbing bug."
+                    if verify_baseline is not None:
+                        expected = verify_baseline[layer_idx][start:stop].to(
+                            device=hidden_states.device, dtype=hidden_states.dtype
                         )
-                timing.callback_s += (time.perf_counter_ns() - t_cb) / 1e9
+                        if mb_mask is not None:
+                            m = mb_mask.bool().unsqueeze(-1)
+                            got_real = hidden_states.masked_select(m)
+                            exp_real = expected.masked_select(m)
+                            ok = torch.equal(got_real, exp_real)
+                        else:
+                            ok = torch.equal(hidden_states, expected)
+                        if not ok:
+                            diff = (hidden_states.float() - expected.float()).abs().max().item()
+                            raise RuntimeError(
+                                f"verify: layer {layer_idx} microbatch [{start}:{stop}] "
+                                f"diverged from naive baseline (max abs diff {diff}). "
+                                f"For bf16 this usually means microbatch_size != dataset "
+                                f"size (see bf16_microbatch_determinism); for fp32 it "
+                                f"indicates a plumbing bug."
+                            )
+                    timing.callback_s += (time.perf_counter_ns() - t_cb) / 1e9
 
-                t_w = time.perf_counter_ns()
-                buffer.write_slice(start, stop, hidden_states)
-                timing.write_s += (time.perf_counter_ns() - t_w) / 1e9
-                timing.bytes_buffer += hidden_states.element_size() * hidden_states.numel()
-                _emit_progress(
-                    "microbatch_end",
-                    layer_idx,
-                    start // mb_size + 1,
-                    n_batches,
-                )
+                    t_w = time.perf_counter_ns()
+                    seg.buffer.write_slice(start, stop, hidden_states)
+                    timing.write_s += (time.perf_counter_ns() - t_w) / 1e9
+                    timing.bytes_buffer += hidden_states.element_size() * hidden_states.numel()
+                    batch_counter += 1
+                    _emit_progress(
+                        "microbatch_end",
+                        layer_idx,
+                        batch_counter,
+                        n_batches,
+                    )
 
             # Drain pending async D2H writes so the next layer's reads see
             # a coherent buffer. One sync per layer is negligible vs the
@@ -1060,7 +1227,9 @@ class Sweep:
         teardown_s = (time.perf_counter_ns() - t0_teardown) / 1e9
 
         profile.total_wall_s = (time.perf_counter_ns() - t0_run) / 1e9
-        profile.total_tokens = n_samples * self.seq_len
+        profile.total_tokens = sum(
+            seg.n_samples * seg.seq_len for seg in segments
+        )
         profile.setup = setup_timing
         profile.embed_s = embed_s
         profile.loop_s = loop_s
