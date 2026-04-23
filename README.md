@@ -198,32 +198,29 @@ fpwap is a plumbing layer. It produces activations and accepts transforms. It do
 
 ## Status
 
-The engine is functional for the SPEC §17 hero path and beats the 950 tok/s
-streaming target. Measured on the reference machine (RTX 5090, 128 GB RAM,
-PCIe 5.0):
+**Llama-3.3-70B on a single RTX 5090 (32 GB VRAM), 10,000 prompts × 128
+tokens, full bf16 precision — 1,221 tok/s.** That's the regime fpwap
+exists for: the model doesn't fit in VRAM, the dataset is thousands of
+prompts, and no quantization is involved. Measured on the reference machine
+(RTX 5090, 128 GB DDR5, PCIe 5.0 NVMe):
 
 | Model | Path | Samples × seq_len | Throughput (bf16) | SPEC target |
 | ----- | ---- | ------------------ | ----------------- | ----------- |
-| Llama-3.1-8B-Instruct | preloaded        | 256 × 128    | 11,894 tok/s | ≥ 5,000 |
-| Llama-3.1-8B-Instruct | streaming        | 256 × 128    |  7,071 tok/s | ≥ 5,000 |
-| Llama-3.1-8B-Instruct | streaming        | 1024 × 128   | 10,442 tok/s | ≥ 5,000 |
-| Llama-3.1-8B-Instruct | _naive cpu_offload baseline_ | 1024 × 128 | _1,440 tok/s_ | _reference_ |
-| Llama-3.3-70B-Instruct | streaming, CPU buf | 1024 × 128  |  1,026 tok/s | ≥ 950 |
-| Llama-3.3-70B-Instruct | streaming, CPU buf, prefetch | 10,000 × 128 | **1,221 tok/s** | ≥ 950 |
+| Llama-3.3-70B-Instruct | streaming, prefetch | 10,000 × 128 | **1,221 tok/s** | ≥ 950 |
+| Llama-3.3-70B-Instruct | streaming            | 1,024 × 128  |  1,026 tok/s | ≥ 950 |
+| Llama-3.1-8B-Instruct  | streaming            | 1,024 × 128  | 10,442 tok/s | ≥ 5,000 |
+| Llama-3.1-8B-Instruct  | preloaded            | 256 × 128    | 11,894 tok/s | ≥ 5,000 |
 
-The 8B streaming-vs-naive head-to-head is a **7.25× speedup** at 1024 × 128
-(SPEC §17 ratio target is ≥ 4×). The naive row is `accelerate.cpu_offload`,
-reproducible via `scripts/benchmark.py --mode naive`. 70B isn't ratio-tested
-on this machine because the full bf16 model (~141 GB) exceeds 128 GB RAM
-for `cpu_offload`; on this hardware the 70B claim is absolute throughput.
-
-The 10k × 128 hero number is end-to-end across 80 layers with a pinned-CPU
+The 70B hero number is end-to-end across 80 layers with a pinned-CPU
 residual buffer (21 GB), async D2H, and a worker-thread weight prefetch
 that overlaps layer L+1's safetensors read with layer L's compute.
-Pre-pin-memory this hit 741 tok/s — writes alone burned 17s per layer;
-with pinning they collapse to ~0s. Prefetch adds another few percent on
-hero (saves wait-on-load when load < forward) and ~25% on the 1024-sample
-microbench (where load dominated).
+
+Baseline sanity: an 8B streaming-vs-naive head-to-head shows a **7.25×
+speedup** at 1024 × 128 (SPEC §17 ratio target ≥ 4×). The naive baseline
+is `accelerate.cpu_offload` at 1,440 tok/s, reproducible via
+`scripts/benchmark.py --mode naive`. 70B can't ratio-test on this machine
+(141 GB bf16 > 128 GB RAM for `cpu_offload`); the 70B claim is absolute
+throughput.
 
 Correctness: `tests/gpu/test_real_llama_bit_exact.py` runs Llama-3.2-1B in bf16
 on CUDA and compares every layer's `residual_post` against a naive HF forward —
@@ -252,8 +249,9 @@ models), per-layer `on_layer_end` artifacts collected into
 `result.artifacts`.
 
 Model families covered by the structural matcher: Llama, Mistral, Qwen2,
-Gemma, and any future HF causal LM exposing the same `model.{embed_tokens,
-layers, rotary_emb}` layout. GPT-2 covered by its own plumbing.
+Gemma, DeepSeek-V2, and any future HF causal LM exposing the same
+`model.{embed_tokens, layers, rotary_emb}` layout. GPT-2 covered by its
+own plumbing.
 
 What's not yet: checkpoint/resume, NVMe-backed ResidualBuffer,
 `verify=True` on the streaming path (pre-loaded only).
