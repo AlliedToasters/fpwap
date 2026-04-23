@@ -404,6 +404,7 @@ class Sweep:
         execution_device: torch.device | str | None = None,
         buffer_device: torch.device | str | None = None,
         apply_final_norm: bool = True,
+        _accel_index: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.model = model
         self.dataset = dataset
@@ -419,6 +420,7 @@ class Sweep:
         self.snapshot_dir = snapshot_dir
         self.offload_dir = offload_dir
         self.apply_final_norm = apply_final_norm
+        self._accel_index = _accel_index
         self.execution_device = (
             torch.device(execution_device) if execution_device is not None else None
         )
@@ -505,10 +507,18 @@ class Sweep:
         """Turn `self.model` into (concrete nn.Module, streamer).
 
         Pre-loaded nn.Module → _PreloadedStreamer (no-op per-layer).
+        Pre-loaded nn.Module + _accel_index → _OffloadStreamer (Extractor reuse).
         String snapshot path → build empty-weights model + _OffloadStreamer
         backed by OffloadedWeightsLoader.
         """
         if isinstance(self.model, nn.Module):
+            if self._accel_index is not None:
+                if self.execution_device is None:
+                    raise ValueError(
+                        "execution_device is required when using a pre-built accel_index "
+                        "(Extractor path)"
+                    )
+                return self.model, _OffloadStreamer(self._accel_index, self.execution_device)
             return self.model, _PreloadedStreamer(self.execution_device)
         if isinstance(self.model, str):
             if self.execution_device is None:
