@@ -72,6 +72,7 @@ def test_raw_activations_last_token_matches_naive() -> None:
         transport_dtype=torch.float32,
         microbatch_size=2,  # exercise the multi-microbatch concat path
         seed=SEED,
+        apply_final_norm=False,
     )
     result = sweep.run()
 

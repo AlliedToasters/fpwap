@@ -28,10 +28,10 @@ import time
 from pathlib import Path
 
 import torch
-from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from fpwap import Callback, Sweep
+from fpwap.loader import resolve_snapshot_dir
 from fpwap.types import BatchResult, HookName
 
 
@@ -167,13 +167,6 @@ def _run_naive(
     return wall_s, total_tokens, len(blocks)
 
 
-def _resolve_snapshot_dir(model_id: str) -> Path:
-    """Return an on-disk path for the model. Uses HF cache if present; does
-    not download. Accepts either an HF hub id or an absolute path."""
-    p = Path(model_id)
-    if p.is_dir():
-        return p
-    return Path(snapshot_download(model_id, local_files_only=True))
 
 
 def main() -> None:
@@ -203,7 +196,7 @@ def main() -> None:
     dtype = getattr(torch, args.dtype)
     device = torch.device(args.device)
 
-    snapshot_dir = _resolve_snapshot_dir(args.model)
+    snapshot_dir = resolve_snapshot_dir(args.model)
     tokenizer = AutoTokenizer.from_pretrained(snapshot_dir)
     dataset = _build_synthetic_dataset(tokenizer, args.n_samples, args.seq_len, device)
 

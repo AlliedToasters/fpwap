@@ -124,6 +124,7 @@ def test_streaming_path_matches_naive(tmp_path: Path) -> None:
         transport_dtype=torch.float32,
         execution_device="cpu",
         seed=SEED,
+        apply_final_norm=False,
     )
     result = run.run()
 

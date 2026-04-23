@@ -47,6 +47,12 @@ class LlamaPlumbing:
         inner = cast(Any, model).model
         return cast(Tensor, inner.embed_tokens(input_ids))
 
+    def final_norm_module(self, model: nn.Module) -> nn.Module | None:
+        return cast(nn.Module, cast(Any, model).model.norm)
+
+    def final_norm_param_names(self, model: nn.Module) -> Sequence[str]:
+        return ["model.norm.weight"]
+
     def layer_forward_with_hooks(
         self,
         model: nn.Module,

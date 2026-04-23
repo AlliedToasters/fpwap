@@ -96,6 +96,7 @@ def test_buffer_device_split_matches_naive() -> None:
         microbatch_size=2,
         buffer_device="cpu",  # explicit even though exec is also CPU
         seed=SEED,
+        apply_final_norm=False,
     )
     run.run()
 

@@ -105,6 +105,7 @@ def test_fpwap_matches_naive_forward_cpu_gpt2() -> None:
         callbacks=[cap],
         transport_dtype=torch.float32,
         seed=SEED,
+        apply_final_norm=False,
     )
     run.run()
 

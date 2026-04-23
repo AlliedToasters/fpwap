@@ -403,6 +403,7 @@ class Sweep:
         offload_dir: str | None = None,
         execution_device: torch.device | str | None = None,
         buffer_device: torch.device | str | None = None,
+        apply_final_norm: bool = True,
     ) -> None:
         self.model = model
         self.dataset = dataset
@@ -417,6 +418,7 @@ class Sweep:
         self.microbatch_size = microbatch_size
         self.snapshot_dir = snapshot_dir
         self.offload_dir = offload_dir
+        self.apply_final_norm = apply_final_norm
         self.execution_device = (
             torch.device(execution_device) if execution_device is not None else None
         )
@@ -515,7 +517,12 @@ class Sweep:
                 )
             from pathlib import Path
 
-            snapshot_dir = Path(self.snapshot_dir) if self.snapshot_dir else Path(self.model)
+            from fpwap.loader import resolve_snapshot_dir
+
+            if self.snapshot_dir is not None:
+                snapshot_dir = Path(self.snapshot_dir)
+            else:
+                snapshot_dir = resolve_snapshot_dir(self.model)
             model, accel_index = build_empty_model_and_index(
                 model_id=self.model,
                 snapshot_dir=snapshot_dir,
@@ -569,6 +576,16 @@ class Sweep:
         # Streaming path: load pass-0 embedding weights onto the execution device.
         streamer.ensure_embedding_loaded(model, plumbing)
 
+        # If apply_final_norm is set, resolve the norm module and ensure its
+        # params are on the execution device (streaming path loads them here;
+        # preloaded path already has them resident).
+        final_norm: nn.Module | None = None
+        if self.apply_final_norm:
+            final_norm = plumbing.final_norm_module(model)
+            if final_norm is not None and isinstance(streamer, _OffloadStreamer):
+                for name in plumbing.final_norm_param_names(model):
+                    _load_named_param(model, name, streamer._loader, exec_device)
+
         sweep_id = uuid.uuid4().hex[:12]
         ctx = Context(
             sweep_id=sweep_id,
@@ -589,7 +606,7 @@ class Sweep:
         # attention_mask, else None. Stored once; reused every layer so the
         # 2D→additive conversion happens inside layer_forward per microbatch.
         has_mask = _has_attention_mask(items)
-        mask_pin = buf_device.type == "cpu"
+        mask_pin = buf_device.type == "cpu" and torch.cuda.is_available()
         mask_buffer: Tensor | None = (
             torch.zeros(
                 (n_samples, self.seq_len),
@@ -773,6 +790,11 @@ class Sweep:
                         dispatch_fn=inline_dispatch,
                     )
                 timing.forward_s += (time.perf_counter_ns() - t_fwd) / 1e9
+
+                # Last layer + apply_final_norm: apply the model's final
+                # layernorm so residual_post matches HF's output_hidden_states.
+                if final_norm is not None and layer_idx == n_layers - 1:
+                    hidden_states = final_norm(hidden_states)
 
                 t_cb = time.perf_counter_ns()
                 # Sub-layer extras that the plumbing didn't dispatch inline

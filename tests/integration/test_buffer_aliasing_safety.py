@@ -93,6 +93,7 @@ def test_residual_pre_and_post_both_correct_in_same_sweep() -> None:
         microbatch_size=2,
         seed=SEED,
         progress=False,
+        apply_final_norm=False,
     )
     result = sweep.run()
 

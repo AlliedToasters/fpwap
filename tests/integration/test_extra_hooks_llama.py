@@ -113,6 +113,7 @@ def test_extra_hooks_match_naive_llama(hook: str) -> None:
         microbatch_size=N_SAMPLES,
         seed=SEED,
         progress=False,
+        apply_final_norm=False,
     )
     result = sweep.run()
 

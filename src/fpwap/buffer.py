@@ -35,7 +35,7 @@ class ResidualBuffer:
         self.dtype = dtype
         self.device = torch.device(device)
         self.path = path
-        pin = self.device.type == "cpu"
+        pin = self.device.type == "cpu" and torch.cuda.is_available()
         self._data: Tensor = torch.zeros(
             (n_samples, seq_len, hidden),
             dtype=dtype,
