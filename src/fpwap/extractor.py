@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch import nn
@@ -77,7 +77,7 @@ class Extractor:
         verify: bool = False,
         progress: bool | Any = True,
         seed: int = 0,
-        microbatch_size: int | None = None,
+        microbatch_size: int | Literal["auto"] | None = None,
         offload_dir: str | None = None,
         execution_device: torch.device | str | None = None,
         buffer_device: torch.device | str | None = None,
