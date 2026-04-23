@@ -1,14 +1,7 @@
 # `fpwap` — Forward Pass Weight Amortization Protocol
 
-**Status:** Draft v2 · design spec, not yet implemented
-**Working name:** `fpwap` 
-
-**Changes from v1:**
-- Reframed motivation and mental model: accelerate is the "move weights to GPU" layer, fpwap is the "amortize that cost across a dataset" layer on top.
-- Removed the bespoke `LayerLoader` protocol. fpwap uses `accelerate.utils.OffloadedWeightsLoader` directly.
-- Rewrote §12 (Model Loading) with concrete accelerate recipes, including the mmap-from-HF-cache path for models larger than CPU RAM.
-- Added Appendix C (the mmap-from-cache recipe, verbatim) and Appendix D (gotchas from real integration work).
-- Updated §17 success criteria to measure against `accelerate.cpu_offload` as the naive baseline, not a hand-rolled equivalent.
+**Status:** Draft · design spec, not yet implemented
+**Working name:** `fpwap`
 
 ---
 
@@ -18,7 +11,7 @@ Accelerate's `cpu_offload` and `disk_offload` solve per-forward weight streaming
 
 What accelerate does not do is amortize the streaming cost across a dataset. A 2,500-batch pass through Llama-70B still calls 2,500 forwards, each of which restreams ~140 GB of weights — ~350 TB total. On a retail rig with a PCIe 4.0 link, wall-clock is bandwidth-bound for the entire run.
 
-**fpwap inverts the loop.** Instead of "for each batch, do a full forward," it is "for each layer, stream the whole dataset through it." Load layer `N` once, run every microbatch through it, write the post-layer residual to NVMe, advance to layer `N+1`. Weight I/O drops from `O(N_batches × N_layers)` to `O(N_layers)`. For a 10k-sample fpwap through 70B, that is ~140 GB of weight streaming total — roughly the cost of one naive batch.
+**fpwap inverts the loop.** Instead of "for each batch, do a full forward," it is "for each layer, stream the whole dataset through it." Load layer `N` once, run every microbatch through it, write the post-layer residual to NVMe, advance to layer `N+1`. Weight I/O drops from `O(N_batches × N_layers)` to `O(N_layers)`. For a 10k-sample run through 70B, that is ~140 GB of weight streaming total — roughly the cost of one naive batch.
 
 **The trade:** one residual-stream buffer persisted between layers — `N_samples × seq × hidden × dtype_bytes`. At seq=256, hidden=8192, bf16, 10k samples: ~40 GB. Cheap on a big-NVMe workstation, impossible on a GPU-only cloud box. This library assumes the former.
 
@@ -26,7 +19,7 @@ What accelerate does not do is amortize the streaming cost across a dataset. A 2
 
 ## 2. Scope
 
-### In scope (v1)
+### In scope
 
 - Single-node, single-GPU execution on dense transformer architectures.
 - Fixed-length forward passes: encoder-style inference where `seq_len` is known per batch and attention is non-causal-dependent across samples.
@@ -37,7 +30,7 @@ What accelerate does not do is amortize the streaming cost across a dataset. A 2
 - Multi-pass workflows where pass-N artifacts feed pass-(N+1) callbacks.
 - **Models larger than CPU RAM** via the mmap-from-HF-cache path (§12.3).
 
-### Out of scope (v1)
+### Out of scope
 
 - Autoregressive generation. KV-cache dependencies across time steps break loop inversion. Explicitly unsupported; preflight should detect and reject.
 - Training-time gradient flow. Deferred (see §13). API should not preclude.
@@ -48,7 +41,7 @@ What accelerate does not do is amortize the streaming cost across a dataset. A 2
 ### Non-goals
 
 - Replacing accelerate or HuggingFace. fpwap is built *on* accelerate. Any weight-movement feature that already exists in accelerate should be used directly, not wrapped.
-- Being a probing library. Probing is a downstream consumer (lmprobe). fpwap produces activations and accepts transforms; it does not know what a probe is.
+- Being a probing library. Probing is a downstream consumer concern. fpwap produces activations and accepts transforms; it does not know what a probe is.
 
 ### Dependencies
 
@@ -70,7 +63,7 @@ Base class users subclass. Declares which layers/hooks it targets, which phase i
 
 ### 3.3 `StorageBackend`
 
-Interface for writing per-sample outputs. Default implementation is memmap + parquet index (matching the lmprobe v2 `shard_index` / `row_offset` contract). Alternate backends: sharded safetensors, zstd-compressed numpy.
+Interface for writing per-sample outputs. Default implementation is memmap + parquet index. Alternate backends: sharded safetensors, zstd-compressed numpy.
 
 ### 3.4 `ResidualBuffer`
 
@@ -78,7 +71,7 @@ The inter-layer transport. Backed by a single NVMe memmap sized `N_samples × se
 
 ### 3.5 `fpwapArtifact`
 
-The output of a fpwap-scoped or layer-scoped callback. Named, addressable by `(fpwap_id, layer_idx, hook, kind)`. Can be passed as input to a subsequent fpwap. Examples: fitted PCA basis per layer, difference-of-means vector per layer, steering vector.
+The output of a run-scoped or layer-scoped callback. Named, addressable by `(fpwap_id, layer_idx, hook, kind)`. Can be passed as input to a subsequent run. Examples: fitted PCA basis per layer, difference-of-means vector per layer, steering vector.
 
 ### 3.6 `Preflight`
 
@@ -128,7 +121,7 @@ class fpwapCallback:
     target_layers: Sequence[int] | Literal["all"] = "all"
     target_hooks: Sequence[HookName] = ("residual_post",)
     phase: Literal["read", "write", "read_after_write"] = "read"
-    needs_grad: bool = False  # reserved for future; v1 must be False
+    needs_grad: bool = False  # reserved for future; must be False
 
     def on_fpwap_start(self, ctx: fpwapContext) -> None: ...
     def on_layer_start(self, layer_idx: int) -> None: ...
@@ -158,7 +151,7 @@ Within a single `(layer_idx, hook)` trigger:
 2. All `write` callbacks, composed (see §5.3). Produce post-write residual.
 3. All `read_after_write` callbacks, in registration order. See post-write residual.
 
-Registration order within a phase should not be load-bearing. If a callback's correctness depends on another callback running first, encode that as an explicit fpwap dependency, not an ordering hack.
+Registration order within a phase should not be load-bearing. If a callback's correctness depends on another callback running first, encode that as an explicit dependency, not an ordering hack.
 
 ### 5.3 Write composition
 
@@ -174,14 +167,14 @@ Additive is right for "sum of steering vectors." Sequential is right for "projec
 
 1. **Stateless per-batch emit.** Raw activation extraction, frozen probe application, projection onto a precomputed basis. `on_batch` → `Emit`.
 2. **Per-batch emit + per-layer finalize.** Streaming DoM, per-layer moments. `on_batch` → `Emit`; `on_layer_end` → `LayerArtifact`.
-3. **Per-batch accumulate, fpwap-end emit.** Incremental PCA, quantile sketches, activation atlases. Stateful `on_batch`; `on_fpwap_end` → `fpwapArtifact`. No per-sample storage.
+3. **Per-batch accumulate, end emit.** Incremental PCA, quantile sketches, activation atlases. Stateful `on_batch`; `on_fpwap_end` → `fpwapArtifact`. No per-sample storage.
 4. **Write-back (steering, ablation).** `on_batch` → `WriteBack`; `phase = "write"`.
 
 The engine materializes only the hooks that have at least one callback registered. A layer with no callbacks is a pure transport step.
 
 ## 6. Targeting and Hook Taxonomy
 
-### 6.1 Hook names (v1)
+### 6.1 Hook names
 
 - `residual_pre` — residual entering the layer (post-embedding for layer 0).
 - `residual_post` — residual leaving the layer (what goes into `residual_buffer`).
@@ -211,7 +204,7 @@ class StorageBackend(Protocol):
 
 ### 7.2 Default backend
 
-Memmap + parquet index. Preserves the `shard_index` / `row_offset` contract from lmprobe v2:
+Memmap + parquet index:
 
 - One parquet manifest per `(fpwap, layer, hook, kind)` with `(sample_id, shard_index, row_offset)`.
 - Sharded safetensors or raw memmap for activations.
@@ -221,13 +214,13 @@ Memmap + parquet index. Preserves the `shard_index` / `row_offset` contract from
 
 - **Safetensors-sharded** — for publishing to HF Hub.
 - **Zstd-numpy** — for compressible content (logits, one-hots).
-- **Null** — for write-back-only fpwaps; no storage cost.
+- **Null** — for write-back-only runs; no storage cost.
 
 ## 8. Dtype Policy
 
 ### 8.1 Transport
 
-`residual_buffer` is bf16 by default. Override to fp16 or fp32 per fpwap. Match the model's native dtype to avoid per-batch casting.
+`residual_buffer` is bf16 by default. Override to fp16 or fp32 per run. Match the model's native dtype to avoid per-batch casting.
 
 ### 8.2 Statistical accumulation
 
@@ -291,7 +284,7 @@ class PreflightReport:
 
 Microbatch size by binary search on a dry-run single layer. Wall-clock by `N_layers × (load_time + microbatches × per_microbatch_fwd)`. Per-layer peak VRAM from static analysis of parameter count + activation footprint. Loading strategy selection per §12.2.
 
-This is the marketing demo. "Here's your 70B fpwap, it will finish in 47 minutes, it will produce 120 GB of activations, you have 800 GB free, press enter."
+This is the marketing demo. "Here's your 70B run, it will finish in 47 minutes, it will produce 120 GB of activations, you have 800 GB free, press enter."
 
 ## 11. Multi-pass Workflows
 
@@ -321,14 +314,14 @@ Pass 1 fits per-layer PCA. Pass 2 computes probe readouts post-ablation of a sin
 
 ## 12. Model Loading via Accelerate
 
-This is the biggest change from v1. fpwap uses three accelerate loading strategies depending on where the model fits, selected automatically by preflight.
+fpwap uses three accelerate loading strategies depending on where the model fits, selected automatically by preflight.
 
 ### 12.1 Three regimes
 
 | Strategy | Right when |
 |---|---|
 | `cpu_offload(model, execution_device=cuda:0)` | Model fits in CPU RAM. Fastest per-forward streaming. For fpwap: used with manual load/unload cadence, not per-forward hooks. |
-| `disk_offload(model, offload_dir)` | Model fits in CPU RAM, fpwap is long-running, NVMe offload amortizes reads. |
+| `disk_offload(model, offload_dir)` | Model fits in CPU RAM, run is long-running, NVMe offload amortizes reads. |
 | mmap-from-HF-cache (§12.3) | Model *does not* fit in CPU RAM. Strictly more general than the above two; works for any model that fits on disk. |
 
 ### 12.2 Strategy selection (preflight)
@@ -396,27 +389,27 @@ def _unload_layer(model, layer_idx):
         param.data = torch.empty(0, device="meta")
 ```
 
-**Approach B (fallback):** install hooks but manually trigger pre-hook once per layer, suppress post-hook until fpwap window closes. More fragile; use only if Approach A has an unforeseen blocker.
+**Approach B (fallback):** install hooks but manually trigger pre-hook once per layer, suppress post-hook until the fpwap window closes. More fragile; use only if Approach A has an unforeseen blocker.
 
-v1 implements Approach A.
+fpwap implements Approach A.
 
 ### 12.5 What fpwap does NOT reimplement from accelerate
 
 - Pinned host memory and async H2D transfer — accelerate's `OffloadedWeightsLoader` handles this.
 - `safe_open` handle caching — `OffloadedWeightsLoader` keeps these alive internally.
-- Stream synchronization for compute/transfer overlap — built into accelerate's hook path (referenced for non-fpwap forwards; fpwap's manual path uses `non_blocking=True` and a single CUDA stream for v1, adds multi-stream overlap if benchmarks justify).
+- Stream synchronization for compute/transfer overlap — built into accelerate's hook path (referenced for non-fpwap forwards; fpwap's manual path uses `non_blocking=True` and a single CUDA stream initially, adding multi-stream overlap if benchmarks justify).
 - Per-forward streaming for non-fpwap calls — if users want to call `model(x)` outside of fpwap (e.g. for a quick eval), accelerate's standard offload paths work as normal.
 
 ## 13. Deferred: Training Mode
 
-Not implemented in v1, but the API should not preclude:
+Not yet implemented, but the API should not preclude:
 
 - `fpwapCallback.needs_grad: bool`.
 - Engine tracks whether any callback at layer `L` needs grads. If yes, retain graph for that layer; otherwise `no_grad`.
 - A "trainable head" pattern: small GPU-resident module, receives activations, accumulates loss, backprops at `on_layer_end`.
-- Write-back with grad is *not* supported even in principle — turns the fpwap into a backward pass, separate design exercise.
+- Write-back with grad is *not* supported even in principle — turns fpwap into a backward pass, separate design exercise.
 
-Design review before v2: does the current API require the engine to know about optimizers, or can the callback own its optimizer entirely? Preference: callback owns optimizer, engine owns scheduler of grad-enabled layers.
+Design question: does the current API require the engine to know about optimizers, or can the callback own its optimizer entirely? Preference: callback owns optimizer, engine owns scheduler of grad-enabled layers.
 
 ## 14. Error Handling and Debugging
 
@@ -440,7 +433,7 @@ from fpwap.storage import MemmapBackend
 from fpwap.loader import load_from_cache
 from fpwap.callbacks.common import RawActivations, IncrementalPCA, DiffOfMeans
 
-fpwap = fpwap(
+run = fpwap(
     model="meta-llama/Llama-3.1-70B",
     dataset=my_dataset,
     seq_len=256,
@@ -455,35 +448,31 @@ fpwap = fpwap(
     # loading_strategy="mmap_from_cache",
 )
 
-plan = fpwap.preflight()
+plan = run.preflight()
 print(plan.summary())
 
-result = fpwap.run()
+result = run.run()
 result.artifact("pca_basis", layer=45)
 result.activations(layer=45, hook="residual_post")
 ```
 
 ## 16. Open Questions
 
-1. **Name.** Defer until extraction.
-2. **Attention patterns.** Different shape, different storage. v1.1 if demanded.
-3. **Dataset contract.** v1 assumes yields `(input_ids, attention_mask, sample_id, metadata)`. Metadata opaque to engine, available to callbacks via `MetadataAccessor` injected at `on_fpwap_start`.
-4. **Partial write-back.** Can a write-back callback modify a subset of samples? v1: full tensor, unmodified samples return `acts_in` unchanged.
-5. **Determinism across hardware.** bf16 matmul is not bitwise identical across GPUs. Verification mode tolerance must be aware. Document per (architecture, dtype).
-6. **Multi-stream transfer overlap.** Approach A (§12.4) uses a single CUDA stream. If benchmarks show bandwidth is not saturated, add a second stream for weight prefetch of layer `N+1` during layer `N` compute.
+1. **Attention patterns.** Different shape, different storage. Deferred if demanded.
+2. **Dataset contract.** Assumes yields `(input_ids, attention_mask, sample_id, metadata)`. Metadata opaque to engine, available to callbacks via `MetadataAccessor` injected at `on_fpwap_start`.
+3. **Partial write-back.** Can a write-back callback modify a subset of samples? Current design: full tensor, unmodified samples return `acts_in` unchanged.
+4. **Determinism across hardware.** bf16 matmul is not bitwise identical across GPUs. Verification mode tolerance must be aware. Document per (architecture, dtype).
+5. **Multi-stream transfer overlap.** Approach A (§12.4) uses a single CUDA stream. If benchmarks show bandwidth is not saturated, add a second stream for weight prefetch of layer `N+1` during layer `N` compute.
 
 ## 17. Success Criteria
 
-v1 ships when:
+Ships when:
 
-- A 10k-sample fpwap through Llama-3.1-70B on a 32 GB GPU completes in **≤ 25% of the wall-clock** of the `accelerate.cpu_offload` naive baseline, and produces activations identical within bf16 tolerance.
-- A 10k-sample fpwap through Llama-3.1-405B on 128 GB RAM / 32 GB VRAM completes at all via the mmap-from-HF-cache path.
-- Mid-fpwap kill resumes correctly.
+- A 10k-sample run through Llama-3.1-70B on a 32 GB GPU completes in **≤ 25% of the wall-clock** of the `accelerate.cpu_offload` naive baseline, and produces activations identical within bf16 tolerance.
+- A 10k-sample run through Llama-3.1-405B on 128 GB RAM / 32 GB VRAM completes at all via the mmap-from-HF-cache path.
+- Mid-run kill resumes correctly.
 - Four reference callbacks (raw extraction, incremental PCA, DoM, steering) each <200 LoC.
-- `lmprobe` consumes fpwap as a dependency. lmprobe's bespoke chunked-loading code is deleted; non-fpwap forwards go through accelerate directly.
 - Preflight rejects infeasible configurations with clear, actionable messages before touching GPU.
-
-Anything less is a prototype, not v1.
 
 ---
 
@@ -558,7 +547,7 @@ class SteerInBasis(fpwapCallback):
 
 ## Appendix B — What this spec deliberately does not contain
 
-- A probe abstraction. Probes live in lmprobe and are built on top of fpwap callbacks.
+- A probe abstraction. Probing is a downstream consumer concern; fpwap produces activations and accepts transforms.
 - A dataset loader. Datasets are user-supplied and conform to a minimal protocol.
 - A serving or API layer.
 - Opinions on activation visualization.
@@ -658,7 +647,7 @@ fpwap uses the underlying `OffloadedWeightsLoader` (constructed from `accel_inde
 
 ## Appendix D — Gotchas (ranked by cost)
 
-From real integration work on the deception-detection fork. Every one of these cost a nontrivial number of hours; document them so the next person doesn't pay the same tuition.
+From real integration work. Every one of these cost a nontrivial number of hours; document them so the next person doesn't pay the same tuition.
 
 ### D.1 safetensors dtype strings ≠ torch attribute names
 
@@ -686,7 +675,7 @@ Order: build index → alias tied weights → write to disk → call `disk_offlo
 
 ### D.5 Pass 0 (embedding) is a special case
 
-The residual buffer is populated by running the embedding layer over the whole dataset before the fpwap loop starts. Embedding weights are much smaller than a transformer block — keep them resident on GPU for pass 0 rather than streaming them. Saves a load/unload per fpwap.
+The residual buffer is populated by running the embedding layer over the whole dataset before the main loop starts. Embedding weights are much smaller than a transformer block — keep them resident on GPU for pass 0 rather than streaming them. Saves a load/unload per run.
 
 ### D.6 Attention mask shape assumptions
 
