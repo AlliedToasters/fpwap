@@ -61,6 +61,7 @@ def _run_fpwap(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[
         microbatch_size=N_SAMPLES,
         seed=SEED,
         progress=False,
+        apply_final_norm=False,
     )
     result = sweep.run()
     return {i: result.activations(layer=i, hook="residual_post") for i in range(N_LAYERS)}

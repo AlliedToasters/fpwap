@@ -34,6 +34,12 @@ class GPT2Plumbing:
         hidden: Tensor = t.wte(input_ids) + t.wpe(position_ids)
         return cast(Tensor, t.drop(hidden))
 
+    def final_norm_module(self, model: nn.Module) -> nn.Module | None:
+        return cast(nn.Module, cast(Any, model).transformer.ln_f)
+
+    def final_norm_param_names(self, model: nn.Module) -> Sequence[str]:
+        return ["transformer.ln_f.weight", "transformer.ln_f.bias"]
+
     def layer_forward_with_hooks(
         self,
         model: nn.Module,

@@ -52,6 +52,7 @@ def test_verify_passes_when_fpwap_matches_naive() -> None:
         seed=SEED,
         progress=False,
         verify=True,
+        apply_final_norm=False,
     )
     sweep.run()  # must not raise
 
@@ -85,6 +86,7 @@ def test_verify_with_padded_mask_masks_pad_positions() -> None:
         seed=SEED,
         progress=False,
         verify=True,
+        apply_final_norm=False,
     )
     sweep.run()  # must not raise; pad positions excluded from compare
 
@@ -102,6 +104,7 @@ def test_verify_raises_on_streaming_model(tmp_path) -> None:
         seed=SEED,
         progress=False,
         verify=True,
+        apply_final_norm=False,
     )
     with pytest.raises(NotImplementedError, match="pre-loaded nn.Module"):
         sweep.run()

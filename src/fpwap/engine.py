@@ -403,6 +403,7 @@ class Sweep:
         offload_dir: str | None = None,
         execution_device: torch.device | str | None = None,
         buffer_device: torch.device | str | None = None,
+        apply_final_norm: bool = True,
     ) -> None:
         self.model = model
         self.dataset = dataset
@@ -417,6 +418,7 @@ class Sweep:
         self.microbatch_size = microbatch_size
         self.snapshot_dir = snapshot_dir
         self.offload_dir = offload_dir
+        self.apply_final_norm = apply_final_norm
         self.execution_device = (
             torch.device(execution_device) if execution_device is not None else None
         )
@@ -573,6 +575,16 @@ class Sweep:
 
         # Streaming path: load pass-0 embedding weights onto the execution device.
         streamer.ensure_embedding_loaded(model, plumbing)
+
+        # If apply_final_norm is set, resolve the norm module and ensure its
+        # params are on the execution device (streaming path loads them here;
+        # preloaded path already has them resident).
+        final_norm: nn.Module | None = None
+        if self.apply_final_norm:
+            final_norm = plumbing.final_norm_module(model)
+            if final_norm is not None and isinstance(streamer, _OffloadStreamer):
+                for name in plumbing.final_norm_param_names(model):
+                    _load_named_param(model, name, streamer._loader, exec_device)
 
         sweep_id = uuid.uuid4().hex[:12]
         ctx = Context(
@@ -778,6 +790,11 @@ class Sweep:
                         dispatch_fn=inline_dispatch,
                     )
                 timing.forward_s += (time.perf_counter_ns() - t_fwd) / 1e9
+
+                # Last layer + apply_final_norm: apply the model's final
+                # layernorm so residual_post matches HF's output_hidden_states.
+                if final_norm is not None and layer_idx == n_layers - 1:
+                    hidden_states = final_norm(hidden_states)
 
                 t_cb = time.perf_counter_ns()
                 # Sub-layer extras that the plumbing didn't dispatch inline

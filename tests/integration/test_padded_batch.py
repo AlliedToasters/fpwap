@@ -128,6 +128,7 @@ def test_padded_batch_matches_naive_at_real_positions() -> None:
         callbacks=[cap],
         transport_dtype=torch.float32,
         seed=SEED,
+        apply_final_norm=False,
     )
     run.run()
 

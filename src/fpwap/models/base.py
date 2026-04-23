@@ -33,6 +33,23 @@ class ModelPlumbing(Protocol):
 
     def embed(self, model: nn.Module, input_ids: Tensor) -> Tensor: ...
 
+    def final_norm_module(self, model: nn.Module) -> nn.Module | None:
+        """The model's final layernorm applied after the last transformer block.
+
+        GPT-2: transformer.ln_f; Llama family: model.model.norm.
+        Returns None if the architecture has no such norm (unlikely for
+        standard decoder-only transformers).
+        """
+        ...
+
+    def final_norm_param_names(self, model: nn.Module) -> Sequence[str]:
+        """Absolute parameter names for the final norm module.
+
+        Used by the streaming path to load these weights onto the execution
+        device when apply_final_norm=True.
+        """
+        ...
+
     def layer_forward_with_hooks(
         self,
         model: nn.Module,

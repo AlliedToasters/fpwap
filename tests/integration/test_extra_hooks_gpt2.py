@@ -113,6 +113,7 @@ def test_extra_hooks_match_naive(hook: str) -> None:
         microbatch_size=2,
         seed=SEED,
         progress=False,
+        apply_final_norm=False,
     )
     result = sweep.run()
 

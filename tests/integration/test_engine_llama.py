@@ -122,6 +122,7 @@ def test_llama_padded_batch_matches_naive() -> None:
         callbacks=[cap],
         transport_dtype=torch.float32,
         seed=SEED,
+        apply_final_norm=False,
     )
     run.run()
 
