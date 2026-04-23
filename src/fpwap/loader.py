@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,8 @@ import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from torch import nn
+
+_HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 
 
 def resolve_snapshot_dir(model: str) -> Path:
@@ -268,3 +272,81 @@ def _unload_layer(model: nn.Module, layer_idx: int, plumbing: Any) -> None:
     layer = plumbing.layer_modules(model)[layer_idx]
     for rel_name, _ in list(layer.named_parameters()):
         set_module_tensor_to_device(layer, rel_name, "meta")
+
+
+def _parse_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
+    """Parse a safetensors header to get absolute byte offsets per tensor.
+
+    Returns {tensor_name: (abs_start, abs_end)} where offsets are relative
+    to the start of the file (not the data region).
+    """
+    with open(path, "rb") as f:
+        header_size = struct.unpack("<Q", f.read(8))[0]
+        header_bytes = f.read(header_size)
+
+    data_start = 8 + header_size
+    header = json.loads(header_bytes)
+
+    offsets: dict[str, tuple[int, int]] = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        start, end = meta["data_offsets"]
+        offsets[name] = (data_start + start, data_start + end)
+    return offsets
+
+
+class ShardPageAdvisor:
+    """Advises the kernel about page cache for safetensors shards.
+
+    Uses posix_fadvise(DONTNEED) after a layer is unloaded so the kernel
+    can reclaim those pages for upcoming layers. On non-Linux platforms
+    (no posix_fadvise), all methods are silent no-ops.
+    """
+
+    def __init__(self, accel_index: dict[str, dict[str, Any]]) -> None:
+        self._offsets: dict[str, tuple[str, int, int]] = {}
+        if not _HAS_POSIX_FADVISE:
+            return
+
+        shard_paths: set[str] = set()
+        for entry in accel_index.values():
+            shard_paths.add(entry["safetensors_file"])
+
+        shard_offsets: dict[str, dict[str, tuple[int, int]]] = {}
+        for path in shard_paths:
+            shard_offsets[path] = _parse_safetensors_offsets(path)
+
+        for weight_name, entry in accel_index.items():
+            shard_path = entry["safetensors_file"]
+            st_name = entry["weight_name"]
+            if st_name in shard_offsets.get(shard_path, {}):
+                start, end = shard_offsets[shard_path][st_name]
+                self._offsets[weight_name] = (shard_path, start, end)
+
+    def _advise(self, weight_names: list[str], advice: int) -> None:
+        if not _HAS_POSIX_FADVISE:
+            return
+        by_shard: dict[str, list[tuple[int, int]]] = {}
+        for name in weight_names:
+            if name not in self._offsets:
+                continue
+            path, start, end = self._offsets[name]
+            by_shard.setdefault(path, []).append((start, end))
+
+        for path, ranges in by_shard.items():
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    for start, end in ranges:
+                        os.posix_fadvise(fd, start, end - start, advice)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+
+    def advise_dontneed(self, weight_names: list[str]) -> None:
+        self._advise(weight_names, os.POSIX_FADV_DONTNEED)
+
+    def advise_willneed(self, weight_names: list[str]) -> None:
+        self._advise(weight_names, os.POSIX_FADV_WILLNEED)

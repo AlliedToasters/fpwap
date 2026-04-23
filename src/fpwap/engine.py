@@ -12,6 +12,7 @@ from torch import Tensor, nn
 from fpwap.buffer import ResidualBuffer
 from fpwap.callbacks.base import Callback
 from fpwap.loader import (
+    ShardPageAdvisor,
     _load_layer,
     _load_named_param,
     _unload_layer,
@@ -279,6 +280,7 @@ class _OffloadStreamer(_LayerStreamer):
         self._loader = OffloadedWeightsLoader(index=accel_index)
         self._accel_index = accel_index
         self.last_load_bytes = 0
+        self._advisor = ShardPageAdvisor(accel_index)
         # Single-worker pool: next layer's load runs on a worker thread so
         # safetensors read + H2D overlap with the main thread's compute on
         # the current layer. Modern GPUs have a separate copy engine, so
@@ -312,7 +314,13 @@ class _OffloadStreamer(_LayerStreamer):
     def unload_layer(
         self, model: nn.Module, layer_idx: int, plumbing: ModelPlumbing
     ) -> None:
+        prefix = plumbing.layer_prefix(layer_idx)
+        layer = plumbing.layer_modules(model)[layer_idx]
+        weight_names = [
+            f"{prefix}.{rel}" for rel, _ in layer.named_parameters()
+        ]
         _unload_layer(model, layer_idx, plumbing)
+        self._advisor.advise_dontneed(weight_names)
 
     def prefetch_load(
         self, model: nn.Module, layer_idx: int, plumbing: ModelPlumbing
