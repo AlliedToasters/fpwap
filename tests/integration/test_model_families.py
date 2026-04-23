@@ -1,9 +1,10 @@
-"""Cross-family parity: Mistral and Qwen2 ride on LlamaPlumbing's structural matcher.
+"""Cross-family parity: Mistral, Qwen2, Gemma, and DeepSeek-V2 ride on
+LlamaPlumbing's structural matcher.
 
 LlamaPlumbing.matches() fires on any `{model}.model.{layers, embed_tokens,
-rotary_emb}` layout — Mistral and Qwen2 both satisfy this and their
-decoder-block forward signatures are byte-identical to Llama's. These
-tests lock that coverage in so a future HF refactor to either family
+rotary_emb}` layout — Mistral, Qwen2, Gemma, and DeepSeek-V2 all satisfy
+this and their decoder-block forward signatures are compatible with Llama's.
+These tests lock that coverage in so a future HF refactor to any family
 fails loudly rather than silently drifting.
 """
 from __future__ import annotations
@@ -162,4 +163,50 @@ def test_gemma_matches_naive() -> None:
     for i in range(N_LAYERS):
         assert torch.equal(got[i], expected[i].float()), (
             f"gemma layer {i}: max diff {(got[i] - expected[i].float()).abs().max().item()}"
+        )
+
+
+@pytest.mark.integration
+def test_deepseek_v2_matches_naive() -> None:
+    from transformers import DeepseekV2Config, DeepseekV2ForCausalLM
+
+    from fpwap.models import LlamaPlumbing, get_plumbing
+
+    config = DeepseekV2Config(
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        intermediate_size=INTER,
+        num_hidden_layers=N_LAYERS,
+        num_attention_heads=N_HEAD,
+        num_key_value_heads=N_KV_HEAD,
+        max_position_embeddings=SEQ_LEN,
+        kv_lora_rank=16,
+        q_lora_rank=32,
+        qk_nope_head_dim=HIDDEN // N_HEAD // 2,
+        qk_rope_head_dim=HIDDEN // N_HEAD // 2,
+        v_head_dim=HIDDEN // N_HEAD,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        first_k_dense_replace=1,
+        moe_intermediate_size=INTER,
+        n_group=1,
+        topk_group=1,
+        topk_method="greedy",
+        norm_topk_prob=True,
+    )
+    torch.manual_seed(SEED)
+    model = DeepseekV2ForCausalLM(config)
+    model.eval()
+
+    assert isinstance(get_plumbing(model), LlamaPlumbing)
+
+    torch.manual_seed(SEED)
+    input_ids = torch.randint(0, VOCAB, (N_SAMPLES, SEQ_LEN))
+    expected = _capture_per_block(model, input_ids)
+    got = _run_fpwap(model, input_ids)
+
+    for i in range(N_LAYERS):
+        assert torch.equal(got[i], expected[i].float()), (
+            f"deepseek-v2 layer {i}: max diff {(got[i] - expected[i].float()).abs().max().item()}"
         )
