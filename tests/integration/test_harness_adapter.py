@@ -7,7 +7,6 @@ required.
 from __future__ import annotations
 
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -77,20 +76,23 @@ def test_run_fpwap_contract(tmp_path: Path) -> None:
     assert isinstance(load_s, float) and load_s > 0
     assert isinstance(extract_times, list) and len(extract_times) == 2
     assert all(t > 0 for t in extract_times)
-    assert isinstance(fingerprint, float) and math.isfinite(fingerprint)
+    assert isinstance(fingerprint, torch.Tensor)
+    assert fingerprint.ndim == 2
+    assert fingerprint.shape[0] == N_SAMPLES
+    assert fingerprint.shape[1] == N_LAYERS * HIDDEN
     assert isinstance(peak_vram, float)
 
 
 @pytest.mark.integration
 def test_run_fpwap_fingerprint_stable(tmp_path: Path) -> None:
-    """Same inputs -> same fingerprint across iters."""
+    """Same inputs -> same fingerprint across calls."""
     snapshot_dir = tmp_path / "snapshot"
     _write_tiny_gpt2_snapshot(snapshot_dir)
 
     torch.manual_seed(SEED + 1)
     input_ids = torch.randint(0, VOCAB, (N_SAMPLES, SEQ_LEN))
 
-    _, times1, fp1, _ = run_fpwap(
+    _, _, fp1, _ = run_fpwap(
         model_id=str(snapshot_dir),
         pretokenized_batch=input_ids,
         hf_layers=[0, 1],
@@ -98,7 +100,7 @@ def test_run_fpwap_fingerprint_stable(tmp_path: Path) -> None:
         device="cpu",
         dtype=torch.float32,
     )
-    _, times2, fp2, _ = run_fpwap(
+    _, _, fp2, _ = run_fpwap(
         model_id=str(snapshot_dir),
         pretokenized_batch=input_ids,
         hf_layers=[0, 1],
@@ -107,7 +109,7 @@ def test_run_fpwap_fingerprint_stable(tmp_path: Path) -> None:
         dtype=torch.float32,
     )
 
-    assert fp1 == fp2, f"fingerprint drifted: {fp1} vs {fp2}"
+    assert torch.equal(fp1, fp2), f"fingerprint drifted: {fp1} vs {fp2}"
 
 
 @pytest.mark.integration
@@ -130,5 +132,39 @@ def test_run_fpwap_with_attention_mask(tmp_path: Path) -> None:
         attention_mask=attention_mask,
     )
 
-    assert math.isfinite(fingerprint)
+    assert isinstance(fingerprint, torch.Tensor)
+    assert fingerprint.shape == (N_SAMPLES, HIDDEN)
+    assert torch.isfinite(fingerprint).all()
     assert len(extract_times) == 1
+
+
+@pytest.mark.integration
+def test_run_fpwap_mask_affects_fingerprint(tmp_path: Path) -> None:
+    """Masking pad tokens should change the fingerprint vs no mask."""
+    snapshot_dir = tmp_path / "snapshot"
+    _write_tiny_gpt2_snapshot(snapshot_dir)
+
+    torch.manual_seed(SEED + 1)
+    input_ids = torch.randint(0, VOCAB, (N_SAMPLES, SEQ_LEN))
+    attention_mask = torch.ones(N_SAMPLES, SEQ_LEN, dtype=torch.long)
+    attention_mask[:, :2] = 0
+
+    _, _, fp_masked, _ = run_fpwap(
+        model_id=str(snapshot_dir),
+        pretokenized_batch=input_ids,
+        hf_layers=[0],
+        iters=1,
+        device="cpu",
+        dtype=torch.float32,
+        attention_mask=attention_mask,
+    )
+    _, _, fp_unmasked, _ = run_fpwap(
+        model_id=str(snapshot_dir),
+        pretokenized_batch=input_ids,
+        hf_layers=[0],
+        iters=1,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    assert not torch.equal(fp_masked, fp_unmasked)

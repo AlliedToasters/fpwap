@@ -26,22 +26,25 @@ from fpwap.types import BatchResult, HookName
 
 
 class _FingerprintCapture(Callback):
-    """Captures residual_post at specified layers for fingerprinting."""
+    """Captures per-sample masked-mean of residual_post for fingerprinting.
+
+    Stores O(N × H) per layer (pooled), not O(N × S × H).
+    """
 
     phase = "read"
 
     def __init__(
         self,
         n_samples: int,
-        seq_len: int,
         hidden_size: int,
         layers: list[int],
-        dtype: torch.dtype,
+        attention_mask: Tensor | None = None,
     ) -> None:
         self.target_layers = layers
         self.target_hooks: tuple[HookName, ...] = ("residual_post",)
-        self.acts: dict[int, Tensor] = {
-            i: torch.zeros(n_samples, seq_len, hidden_size, dtype=dtype)
+        self.attention_mask = attention_mask
+        self.pooled: dict[int, Tensor] = {
+            i: torch.zeros(n_samples, hidden_size, dtype=torch.float32)
             for i in layers
         }
 
@@ -52,28 +55,30 @@ class _FingerprintCapture(Callback):
         acts: Tensor,
         sample_ids: Tensor,
     ) -> BatchResult:
-        self.acts[layer_idx][sample_ids] = acts.detach().to(self.acts[layer_idx].dtype).cpu()
+        if self.attention_mask is not None:
+            mask = self.attention_mask[sample_ids.cpu()].bool().unsqueeze(-1).float()
+            mask = mask.to(acts.device)
+            num = (acts.float() * mask).sum(dim=1)
+            den = mask.sum(dim=1).clamp(min=1.0)
+            pooled = num / den
+        else:
+            pooled = acts.float().mean(dim=1)
+        self.pooled[layer_idx][sample_ids.cpu()] = pooled.cpu()
         return None
 
 
-def compute_fingerprint(
-    acts: dict[int, Tensor],
-    attention_mask: Tensor | None,
-) -> float:
-    """Per-batch mean of non-pad residuals across captured layers.
+def compute_fingerprint(pooled: dict[int, Tensor]) -> Tensor:
+    """Per-sample mean of non-pad residuals across captured layers.
 
-    Mask pad positions, mean over (sample, position, hidden) dims for each
-    layer, then mean across layers -> single scalar determinism check.
+    Args:
+        pooled: {layer_idx: [N, H]} tensors, already position-pooled.
+
+    Returns:
+        [N, L*H] tensor — per-sample fingerprint concatenated across layers.
     """
-    layer_means: list[float] = []
-    for _layer_idx, hidden in sorted(acts.items()):
-        if attention_mask is not None:
-            mask = attention_mask.bool().unsqueeze(-1)
-            vals = hidden.float().masked_select(mask)
-        else:
-            vals = hidden.float().flatten()
-        layer_means.append(vals.mean().item())
-    return sum(layer_means) / len(layer_means) if layer_means else 0.0
+    if not pooled:
+        return torch.empty(0, 0)
+    return torch.cat([pooled[i] for i in sorted(pooled)], dim=-1)
 
 
 def run_fpwap(
@@ -86,7 +91,7 @@ def run_fpwap(
     dtype: torch.dtype = torch.bfloat16,
     microbatch_size: int | None = None,
     attention_mask: Tensor | None = None,
-) -> tuple[float, list[float], float, float]:
+) -> tuple[float, list[float], Tensor, float]:
     """Run fpwap extraction and return the harness contract tuple.
 
     Args:
@@ -102,8 +107,8 @@ def run_fpwap(
     Returns:
         load_s: Extractor build time (empty model + accel_index).
         extract_times: Per-iteration wall-clock seconds.
-        fingerprint: Per-batch mean of non-pad residuals (scalar).
-        peak_VRAM: Peak GPU memory in bytes via torch.cuda.max_memory_allocated.
+        fingerprint: [N, L*H] tensor — per-sample masked-mean across layers.
+        peak_VRAM: Peak GPU memory in GB.
     """
     use_cuda = torch.cuda.is_available() and "cuda" in device
 
@@ -132,15 +137,14 @@ def run_fpwap(
         dataset.append(item)
 
     extract_times: list[float] = []
-    fingerprint = 0.0
+    fingerprint = torch.empty(0, 0)
 
     for _ in range(iters):
         cap = _FingerprintCapture(
             n_samples=n_samples,
-            seq_len=seq_len,
             hidden_size=hidden_size,
             layers=hf_layers,
-            dtype=dtype,
+            attention_mask=attention_mask,
         )
         sweep = ext.sweep(
             dataset=dataset,
@@ -150,7 +154,7 @@ def run_fpwap(
             execution_device=device,
             microbatch_size=microbatch_size,
             seed=0,
-            progress=False,
+            progress=True,
             apply_final_norm=False,
         )
 
@@ -162,9 +166,11 @@ def run_fpwap(
             torch.cuda.synchronize()
         extract_times.append(time.perf_counter() - t0)
 
-        fingerprint = compute_fingerprint(cap.acts, attention_mask)
+        fingerprint = compute_fingerprint(cap.pooled)
 
-    peak_vram = float(torch.cuda.max_memory_allocated()) if use_cuda else 0.0
+    peak_vram = (
+        torch.cuda.max_memory_allocated() / (1024**3) if use_cuda else 0.0
+    )
 
     return load_s, extract_times, fingerprint, peak_vram
 
@@ -226,8 +232,8 @@ def main() -> None:
     print(f"=== harness_adapter: {args.model} ===")
     print(f"  load_s          : {load_s:.3f}")
     print(f"  extract_times   : {[f'{t:.3f}' for t in extract_times]}")
-    print(f"  fingerprint     : {fingerprint:.8f}")
-    print(f"  peak_VRAM (MB)  : {peak_vram / 1e6:.1f}")
+    print(f"  fingerprint     : {tuple(fingerprint.shape)}, mean={fingerprint.float().mean():.8f}")
+    print(f"  peak_VRAM (GB)  : {peak_vram:.2f}")
     print(f"  iters           : {args.iters}")
     print(f"  N               : {args.n_samples}")
     print(f"  seq_len         : {args.seq_len}")
