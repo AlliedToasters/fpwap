@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -42,11 +43,21 @@ class ResidualBuffer:
             self._mm: np.memmap | None = np.memmap(
                 path, dtype=np_dtype, mode="w+", shape=self._shape
             )
+            if hasattr(os, "posix_madvise"):
+                try:
+                    os.posix_madvise(
+                        self._mm.ctypes.data, self._mm.nbytes,
+                        os.POSIX_MADV_SEQUENTIAL,  # type: ignore[attr-defined]
+                    )
+                except OSError:
+                    pass
+            self._staging: Tensor | None = None
             self._data: Tensor | None = None
         else:
             self._bf16_as_u16 = False
             self._np_dtype = None
             self._mm = None
+            self._staging = None
             pin = self.device.type == "cpu" and torch.cuda.is_available()
             self._data = torch.zeros(
                 self._shape, dtype=dtype, device=self.device, pin_memory=pin,
@@ -77,13 +88,30 @@ class ResidualBuffer:
             return
         assert self._mm is not None
         ids_np = sample_ids.detach().to(device="cpu", dtype=torch.int64).numpy()
-        self._mm[ids_np] = self._tensor_to_np(values)
+        if values.device.type == "cuda":
+            staging = self._ensure_staging(values.shape)
+            if values.dtype != self.dtype:
+                values = values.to(dtype=self.dtype)
+            staging.copy_(values, non_blocking=True)
+            torch.cuda.synchronize()
+            host = staging
+        else:
+            host = values.detach().to(device="cpu", dtype=self.dtype)
+        if self._bf16_as_u16:
+            host = host.view(torch.uint16)
+        self._mm[ids_np] = host.numpy()
 
     def read_slice(self, start: int, stop: int) -> Tensor:
         if self._data is not None:
             return self._data[start:stop]
         assert self._mm is not None
         return self._mm_to_tensor(np.asarray(self._mm[start:stop]).copy())
+
+    def _ensure_staging(self, shape: tuple[int, ...]) -> Tensor:
+        if self._staging is not None and self._staging.shape == shape:
+            return self._staging
+        self._staging = torch.zeros(shape, dtype=self.dtype, pin_memory=True)
+        return self._staging
 
     def write_slice(self, start: int, stop: int, values: Tensor) -> None:
         if self._data is not None:
@@ -92,7 +120,18 @@ class ResidualBuffer:
             self._data[start:stop].copy_(values, non_blocking=True)
             return
         assert self._mm is not None
-        self._mm[start:stop] = self._tensor_to_np(values)
+        if values.device.type == "cuda":
+            staging = self._ensure_staging(values.shape)
+            if values.dtype != self.dtype:
+                values = values.to(dtype=self.dtype)
+            staging.copy_(values, non_blocking=True)
+            torch.cuda.synchronize()
+            host = staging
+        else:
+            host = values.detach().to(device="cpu", dtype=self.dtype)
+        if self._bf16_as_u16:
+            host = host.view(torch.uint16)
+        self._mm[start:stop] = host.numpy()
 
     def flush(self) -> None:
         if self._mm is not None:

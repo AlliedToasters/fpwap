@@ -149,3 +149,66 @@ def test_memmap_backend_bf16_roundtrip(tmp_path: Path) -> None:
     assert mem.dtype == torch.bfloat16
     assert disk.dtype == torch.bfloat16
     assert torch.equal(disk, mem)
+
+
+@pytest.mark.integration
+def test_memmap_backend_bucketed_padding(tmp_path: Path) -> None:
+    """MemmapBackend handles variable seq_len from bucketed padding (fixes #47)."""
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from fpwap import Sweep
+    from fpwap.callbacks.common import RawActivations
+    from fpwap.storage.memmap import MemmapBackend
+
+    bucket_seq = 64
+    config = GPT2Config(
+        vocab_size=VOCAB,
+        n_positions=bucket_seq,
+        n_embd=HIDDEN,
+        n_layer=N_LAYERS,
+        n_head=N_HEAD,
+    )
+    torch.manual_seed(SEED)
+    model = GPT2LMHeadModel(config)
+    model.eval()
+
+    torch.manual_seed(SEED + 1)
+    short_lengths = [3, 5]
+    long_lengths = [40, 50]
+    pad_token = 0
+    items: list[dict[str, torch.Tensor]] = []
+    for L in short_lengths + long_lengths:
+        ids = torch.full((1, bucket_seq), pad_token, dtype=torch.long)
+        mask = torch.zeros((1, bucket_seq), dtype=torch.long)
+        ids[0, bucket_seq - L :] = torch.randint(1, VOCAB, (L,))
+        mask[0, bucket_seq - L :] = 1
+        items.append({"input_ids": ids, "attention_mask": mask})
+
+    def make_sweep(storage):
+        return Sweep(
+            model=model,
+            dataset=items,
+            seq_len=bucket_seq,
+            callbacks=[
+                RawActivations(layers="all", last_token_only=False, out_dtype=torch.float32)
+            ],
+            transport_dtype=torch.float32,
+            microbatch_size=2,
+            seed=SEED,
+            progress=False,
+            padding="bucketed",
+            storage=storage,
+        )
+
+    result_mem = make_sweep(None).run()
+
+    backend = MemmapBackend(root=tmp_path)
+    result_disk = make_sweep(backend).run()
+
+    for layer_idx in range(N_LAYERS):
+        mem = result_mem.activations(layer=layer_idx, hook="residual_post")
+        disk = result_disk.activations(layer=layer_idx, hook="residual_post")
+        assert disk.shape == mem.shape
+        assert torch.equal(disk, mem), (
+            f"layer {layer_idx}: max diff {(disk - mem).abs().max().item()}"
+        )

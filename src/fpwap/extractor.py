@@ -84,6 +84,7 @@ class Extractor:
         apply_final_norm: bool = True,
         chunk_size: int = 1,
         padding: PaddingMode = "fixed",
+        buffer_path: str | Path | None = None,
     ) -> Sweep:
         """Create a Sweep that reuses this Extractor's model and index."""
         from fpwap.engine import Sweep
@@ -107,5 +108,6 @@ class Extractor:
             apply_final_norm=apply_final_norm,
             chunk_size=chunk_size,
             padding=padding,
+            buffer_path=buffer_path,
             _accel_index=self._accel_index,
         )
