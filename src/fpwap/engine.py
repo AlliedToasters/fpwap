@@ -255,6 +255,12 @@ class _LayerStreamer:
         None if this streamer doesn't do prefetch."""
         return None
 
+    def prefetch_chunk(
+        self, model: nn.Module, layer_indices: range, plumbing: ModelPlumbing
+    ) -> Any | None:
+        """Prefetch all layers in a chunk. Returns a future or None."""
+        return None
+
     def close(self) -> None:
         return None
 
@@ -333,10 +339,33 @@ class _OffloadStreamer(_LayerStreamer):
             self.load_layer, model, layer_idx, plumbing
         )
 
+    def prefetch_chunk(
+        self, model: nn.Module, layer_indices: range, plumbing: ModelPlumbing
+    ) -> Any | None:
+        if self._prefetch_pool is None:
+            return None
+
+        def _load_all() -> None:
+            for li in layer_indices:
+                self.load_layer(model, li, plumbing)
+
+        return self._prefetch_pool.submit(_load_all)
+
     def close(self) -> None:
         if self._prefetch_pool is not None:
             self._prefetch_pool.shutdown(wait=True)
             self._prefetch_pool = None
+
+
+def _make_chunks(n_layers: int, chunk_size: int) -> list[range]:
+    """Partition [0, n_layers) into consecutive chunks of at most chunk_size."""
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    chunks: list[range] = []
+    for start in range(0, n_layers, chunk_size):
+        end = min(start + chunk_size, n_layers)
+        chunks.append(range(start, end))
+    return chunks
 
 
 def _callback_applies(cb: Callback, layer_idx: int, hook: HookName) -> bool:
@@ -619,6 +648,7 @@ class Sweep:
         buffer_device: torch.device | str | None = None,
         apply_final_norm: bool = True,
         padding: PaddingMode = "fixed",
+        chunk_size: int = 1,
         _accel_index: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.model = model
@@ -636,6 +666,7 @@ class Sweep:
         self.offload_dir = offload_dir
         self.apply_final_norm = apply_final_norm
         self.padding: PaddingMode = padding
+        self.chunk_size = chunk_size
         self._accel_index = _accel_index
         self.execution_device = (
             torch.device(execution_device) if execution_device is not None else None
@@ -995,21 +1026,14 @@ class Sweep:
         n_layers = len(layer_modules)
         profile = ProfileReport()
 
-        layer_iter: Iterable[int]
+        layer_iter: Any = None
         progress_reporter: ProgressReporter | None = None
         if self.progress is True:
             from tqdm.auto import tqdm
 
-            layer_iter = tqdm(range(n_layers), desc="fpwap layers", dynamic_ncols=True)
-        elif self.progress is False:
-            layer_iter = range(n_layers)
+            layer_iter = tqdm(total=n_layers, desc="fpwap layers", dynamic_ncols=True)
         elif callable(self.progress):
-            # Callable reporter: bypass tqdm, emit ProgressEvents at layer
-            # and microbatch boundaries into the user's sink (wandb, rich, …).
-            layer_iter = range(n_layers)
             progress_reporter = self.progress
-        else:
-            layer_iter = range(n_layers)
 
         def _emit_progress(
             kind: str, layer_idx: int, batch_idx: int, n_batches: int
@@ -1026,189 +1050,232 @@ class Sweep:
                 )
             )
 
-        # Prefetch: a future for the NEXT layer's load, submitted right
-        # after the current layer loads so it overlaps with the microbatch
-        # compute. On first iteration, load sync.
+        # Chunk the layers: each chunk loads N layers at once, processes
+        # all microbatches through all N layers, then unloads.
+        chunks = _make_chunks(n_layers, self.chunk_size)
+
+        # When chunk_size > 1 and the buffer lives on a different device
+        # from the execution device, we allocate a GPU-resident scratch
+        # tensor per segment so intermediate residuals stay on GPU within
+        # a chunk (avoiding H2D/D2H round-trips for every layer boundary).
+        use_gpu_scratch = (
+            self.chunk_size > 1
+            and buf_device.type != exec_device.type
+        )
+
+        # Prefetch: per-layer, same as chunk_size=1. The difference with
+        # chunk_size > 1 is that unloads are deferred to the chunk boundary,
+        # so multiple layers coexist on GPU for the chunk's duration.
         prefetch_future: Any | None = None
 
         t0_loop = time.perf_counter_ns()
-        for layer_idx in layer_iter:
-            timing = LayerTiming()
-            profile.per_layer[layer_idx] = timing
-
-            t_load = time.perf_counter_ns()
-            if prefetch_future is not None:
-                # Wait for the async prefetch to finish; any time that shows
-                # up here is the portion of load that wasn't covered by the
-                # previous layer's compute. Worker-thread H2Ds are CPU-
-                # blocking (source tensors from safetensors mmap aren't
-                # pinned), so `future.result()` returning means the data is
-                # on GPU; the end-of-previous-layer cuda.synchronize() has
-                # already drained the main stream, so no extra sync needed.
-                prefetch_future.result()
-                prefetch_future = None
-            else:
-                streamer.load_layer(model, layer_idx, plumbing)
-            timing.load_s += (time.perf_counter_ns() - t_load) / 1e9
-            timing.bytes_weights += streamer.last_load_bytes
-
-            # Submit prefetch for the next layer immediately so safetensors
-            # read + H2D overlaps with this layer's microbatch compute.
-            # Two layers coexist on GPU briefly until the current layer is
-            # unloaded at the end of the loop body.
-            if layer_idx + 1 < n_layers:
-                prefetch_future = streamer.prefetch_load(
-                    model, layer_idx + 1, plumbing
-                )
-
-            for cb in self.callbacks:
-                cb.on_layer_start(layer_idx)
+        for chunk in chunks:
+            # Allocate GPU scratch for inter-layer residuals within chunk.
+            gpu_scratch: dict[int, Tensor] = {}
+            if use_gpu_scratch and len(chunk) > 1:
+                for seg in segments:
+                    gpu_scratch[id(seg)] = torch.empty(
+                        seg.n_samples, seg.seq_len, hidden,
+                        dtype=self.transport_dtype, device=exec_device,
+                    )
 
             n_batches = sum(
                 (seg.n_samples + seg.mb_size - 1) // seg.mb_size
                 for seg in segments
             )
-            _emit_progress("layer_start", layer_idx, 0, n_batches)
-            block = layer_modules[layer_idx]
-            batch_counter = 0
-            for seg in segments:
-                for start in range(0, seg.n_samples, seg.mb_size):
-                    stop = min(start + seg.mb_size, seg.n_samples)
-                    sample_ids_exec = torch.tensor(
-                        seg.orig_indices[start:stop],
-                        device=exec_device,
-                        dtype=torch.long,
+
+            for layer_idx in chunk:
+                timing = LayerTiming()
+                profile.per_layer[layer_idx] = timing
+
+                is_first_in_chunk = layer_idx == chunk.start
+                is_last_in_chunk = layer_idx == chunk.stop - 1
+                has_scratch = bool(gpu_scratch)
+
+                # Load this layer (wait for prefetch, or sync load).
+                t_load = time.perf_counter_ns()
+                if prefetch_future is not None:
+                    prefetch_future.result()
+                    prefetch_future = None
+                else:
+                    streamer.load_layer(model, layer_idx, plumbing)
+                timing.load_s = (time.perf_counter_ns() - t_load) / 1e9
+                timing.bytes_weights = streamer.last_load_bytes
+
+                # Prefetch next layer so its load overlaps with this layer's
+                # compute. Works across chunk boundaries: the last layer of
+                # this chunk prefetches the first layer of the next chunk.
+                if layer_idx + 1 < n_layers:
+                    prefetch_future = streamer.prefetch_load(
+                        model, layer_idx + 1, plumbing
                     )
 
-                    t_fwd = time.perf_counter_ns()
-                    with torch.no_grad():
-                        hidden_states = seg.buffer.read_slice(start, stop).to(
-                            exec_device, non_blocking=True
+                for cb in self.callbacks:
+                    cb.on_layer_start(layer_idx)
+
+                _emit_progress("layer_start", layer_idx, 0, n_batches)
+                block = layer_modules[layer_idx]
+                batch_counter = 0
+
+                for seg in segments:
+                    for start in range(0, seg.n_samples, seg.mb_size):
+                        stop = min(start + seg.mb_size, seg.n_samples)
+                        sample_ids_exec = torch.tensor(
+                            seg.orig_indices[start:stop],
+                            device=exec_device,
+                            dtype=torch.long,
                         )
-                        mb_mask = (
-                            seg.mask_buffer[start:stop].to(
-                                exec_device, non_blocking=True
+
+                        t_fwd = time.perf_counter_ns()
+                        with torch.no_grad():
+                            if has_scratch and not is_first_in_chunk:
+                                hidden_states = gpu_scratch[id(seg)][start:stop]
+                            else:
+                                hidden_states = seg.buffer.read_slice(start, stop).to(
+                                    exec_device, non_blocking=True
+                                )
+                            mb_mask = (
+                                seg.mask_buffer[start:stop].to(
+                                    exec_device, non_blocking=True
+                                )
+                                if seg.mask_buffer is not None
+                                else None
                             )
-                            if seg.mask_buffer is not None
-                            else None
-                        )
-                        if dispatch_residual_pre:
-                            hidden_states = self._dispatch_callbacks(
-                                layer_idx,
-                                "residual_pre",
+                            if dispatch_residual_pre:
+                                hidden_states = self._dispatch_callbacks(
+                                    layer_idx,
+                                    "residual_pre",
+                                    hidden_states,
+                                    sample_ids_exec,
+                                    emits_sink=emits_sink,
+                                )
+                            inline_dispatch = None
+                            if needs_inline_sublayer_dispatch:
+                                def _inline(
+                                    hook_name: str,
+                                    tensor: Tensor,
+                                    _layer_idx: int = layer_idx,
+                                    _sample_ids: Tensor = sample_ids_exec,
+                                ) -> Tensor:
+                                    return self._dispatch_callbacks(
+                                        _layer_idx,
+                                        hook_name,  # type: ignore[arg-type]
+                                        tensor,
+                                        _sample_ids,
+                                        emits_sink=emits_sink,
+                                        write_allowed=True,
+                                    )
+
+                                inline_dispatch = _inline
+
+                            hidden_states, extras = plumbing.layer_forward_with_hooks(
+                                model,
+                                block,
                                 hidden_states,
+                                attention_mask=mb_mask,
+                                wanted_hooks=sub_hooks,
+                                dispatch_fn=inline_dispatch,
+                            )
+                        timing.forward_s += (time.perf_counter_ns() - t_fwd) / 1e9
+
+                        if final_norm is not None and layer_idx == n_layers - 1:
+                            hidden_states = final_norm(hidden_states)
+
+                        t_cb = time.perf_counter_ns()
+                        for sub_hook, sub_tensor in extras.items():
+                            self._dispatch_callbacks(
+                                layer_idx,
+                                sub_hook,  # type: ignore[arg-type]
+                                sub_tensor,
                                 sample_ids_exec,
                                 emits_sink=emits_sink,
+                                write_allowed=False,
                             )
-                        inline_dispatch = None
-                        if needs_inline_sublayer_dispatch:
-                            def _inline(
-                                hook_name: str,
-                                tensor: Tensor,
-                                _layer_idx: int = layer_idx,
-                                _sample_ids: Tensor = sample_ids_exec,
-                            ) -> Tensor:
-                                return self._dispatch_callbacks(
-                                    _layer_idx,
-                                    hook_name,  # type: ignore[arg-type]
-                                    tensor,
-                                    _sample_ids,
-                                    emits_sink=emits_sink,
-                                    write_allowed=True,
-                                )
-
-                            inline_dispatch = _inline
-
-                        hidden_states, extras = plumbing.layer_forward_with_hooks(
-                            model,
-                            block,
-                            hidden_states,
-                            attention_mask=mb_mask,
-                            wanted_hooks=sub_hooks,
-                            dispatch_fn=inline_dispatch,
-                        )
-                    timing.forward_s += (time.perf_counter_ns() - t_fwd) / 1e9
-
-                    if final_norm is not None and layer_idx == n_layers - 1:
-                        hidden_states = final_norm(hidden_states)
-
-                    t_cb = time.perf_counter_ns()
-                    for sub_hook, sub_tensor in extras.items():
-                        self._dispatch_callbacks(
+                        hidden_states = self._dispatch_callbacks(
                             layer_idx,
-                            sub_hook,  # type: ignore[arg-type]
-                            sub_tensor,
+                            "residual_post",
+                            hidden_states,
                             sample_ids_exec,
                             emits_sink=emits_sink,
-                            write_allowed=False,
                         )
-                    hidden_states = self._dispatch_callbacks(
-                        layer_idx,
-                        "residual_post",
-                        hidden_states,
-                        sample_ids_exec,
-                        emits_sink=emits_sink,
-                    )
-                    if verify_baseline is not None:
-                        expected = verify_baseline[layer_idx][start:stop].to(
-                            device=hidden_states.device, dtype=hidden_states.dtype
-                        )
-                        if mb_mask is not None:
-                            m = mb_mask.bool().unsqueeze(-1)
-                            got_real = hidden_states.masked_select(m)
-                            exp_real = expected.masked_select(m)
-                            ok = torch.equal(got_real, exp_real)
-                        else:
-                            ok = torch.equal(hidden_states, expected)
-                        if not ok:
-                            diff = (hidden_states.float() - expected.float()).abs().max().item()
-                            raise RuntimeError(
-                                f"verify: layer {layer_idx} microbatch [{start}:{stop}] "
-                                f"diverged from naive baseline (max abs diff {diff}). "
-                                f"For bf16 this usually means microbatch_size != dataset "
-                                f"size (see bf16_microbatch_determinism); for fp32 it "
-                                f"indicates a plumbing bug."
+                        if verify_baseline is not None:
+                            expected = verify_baseline[layer_idx][start:stop].to(
+                                device=hidden_states.device, dtype=hidden_states.dtype
                             )
-                    timing.callback_s += (time.perf_counter_ns() - t_cb) / 1e9
+                            if mb_mask is not None:
+                                m = mb_mask.bool().unsqueeze(-1)
+                                got_real = hidden_states.masked_select(m)
+                                exp_real = expected.masked_select(m)
+                                ok = torch.equal(got_real, exp_real)
+                            else:
+                                ok = torch.equal(hidden_states, expected)
+                            if not ok:
+                                diff = (hidden_states.float() - expected.float()).abs().max().item()
+                                raise RuntimeError(
+                                    f"verify: layer {layer_idx} microbatch [{start}:{stop}] "
+                                    f"diverged from naive baseline (max abs diff {diff}). "
+                                    f"For bf16 this usually means microbatch_size != dataset "
+                                    f"size (see bf16_microbatch_determinism); for fp32 it "
+                                    f"indicates a plumbing bug."
+                                )
+                        timing.callback_s += (time.perf_counter_ns() - t_cb) / 1e9
 
-                    t_w = time.perf_counter_ns()
-                    seg.buffer.write_slice(start, stop, hidden_states)
-                    timing.write_s += (time.perf_counter_ns() - t_w) / 1e9
-                    timing.bytes_buffer += hidden_states.element_size() * hidden_states.numel()
-                    batch_counter += 1
-                    _emit_progress(
-                        "microbatch_end",
-                        layer_idx,
-                        batch_counter,
-                        n_batches,
-                    )
+                        t_w = time.perf_counter_ns()
+                        if has_scratch and not is_last_in_chunk:
+                            gpu_scratch[id(seg)][start:stop].copy_(hidden_states)
+                        else:
+                            seg.buffer.write_slice(start, stop, hidden_states)
+                            timing.bytes_buffer += (
+                                hidden_states.element_size() * hidden_states.numel()
+                            )
+                        timing.write_s += (time.perf_counter_ns() - t_w) / 1e9
+                        batch_counter += 1
+                        _emit_progress(
+                            "microbatch_end",
+                            layer_idx,
+                            batch_counter,
+                            n_batches,
+                        )
 
-            # Drain pending async D2H writes so the next layer's reads see
-            # a coherent buffer. One sync per layer is negligible vs the
-            # wins from letting writes overlap with compute within the layer.
+                _emit_progress("layer_end", layer_idx, n_batches, n_batches)
+
+                if hasattr(layer_iter, "set_postfix"):
+                    elapsed = (time.perf_counter_ns() - t0_run) / 1e9
+                    tps = profile.total_tokens / elapsed if elapsed > 0 else 0
+                    layer_iter.set_postfix({"tok/s": f"{tps:,.0f}"})
+
+                for cb in self.callbacks:
+                    layer_art = cb.on_layer_end(layer_idx)
+                    if layer_art is not None:
+                        from fpwap.types import ArtifactKey as _Key
+
+                        layer_artifacts[(layer_art.kind, layer_idx)] = Artifact(
+                            key=_Key(
+                                sweep_id=sweep_id,
+                                layer_idx=layer_idx,
+                                hook="residual_post",
+                                kind=layer_art.kind,
+                            ),
+                            payload=layer_art.payload,
+                        )
+
+                if hasattr(layer_iter, "update"):
+                    layer_iter.update(1)
+
+            # Drain pending async D2H writes so the next chunk's reads see
+            # a coherent buffer.
             if exec_device.type == "cuda":
                 torch.cuda.synchronize()
-            _emit_progress("layer_end", layer_idx, n_batches, n_batches)
 
-            for cb in self.callbacks:
-                layer_art = cb.on_layer_end(layer_idx)
-                if layer_art is not None:
-                    # Per-layer artifacts land in Result.artifacts keyed by
-                    # (kind, layer). Synthesize the full ArtifactKey so
-                    # callers can walk metadata if they want.
-                    from fpwap.types import ArtifactKey as _Key
+            # Free GPU scratch before unloading weights.
+            if gpu_scratch:
+                del gpu_scratch
 
-                    layer_artifacts[(layer_art.kind, layer_idx)] = Artifact(
-                        key=_Key(
-                            sweep_id=sweep_id,
-                            layer_idx=layer_idx,
-                            hook="residual_post",
-                            kind=layer_art.kind,
-                        ),
-                        payload=layer_art.payload,
-                    )
+            for li in chunk:
+                streamer.unload_layer(model, li, plumbing)
 
-            streamer.unload_layer(model, layer_idx, plumbing)
+        if layer_iter is not None and hasattr(layer_iter, "close"):
+            layer_iter.close()
 
         loop_s = (time.perf_counter_ns() - t0_loop) / 1e9
 

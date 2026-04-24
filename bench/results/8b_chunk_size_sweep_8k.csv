@@ -1,0 +1,6 @@
+model,n_samples,seq_len,microbatch,chunk_size,wall_s,tok_s,total_load_s,total_fwd_s,total_buf_MB,n_layers
+meta-llama/Llama-3.1-8B-Instruct,8192,128,64,1,112.87,9290.5,0.61,26.34,274878,32
+meta-llama/Llama-3.1-8B-Instruct,8192,128,64,2,106.88,9810.7,0.65,23.07,137439,32
+meta-llama/Llama-3.1-8B-Instruct,8192,128,64,4,106.58,9838.3,0.71,23.42,68719,32
+meta-llama/Llama-3.1-8B-Instruct,8192,128,64,8,106.60,9836.2,0.70,23.85,34360,32
+meta-llama/Llama-3.1-8B-Instruct,8192,128,64,16,106.43,9852.1,0.75,23.84,17180,32
