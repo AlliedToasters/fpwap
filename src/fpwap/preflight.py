@@ -60,6 +60,9 @@ class PreflightReport:
             )
             lines.append(f"weight I/O: {self.estimated_weight_io_gb:.1f} GB")
 
+        if self.per_layer_peak_vram_gb > 0:
+            lines.append(f"peak VRAM: {self.per_layer_peak_vram_gb:.1f} GB")
+
         recs: list[str] = []
         if self.recommended_buffer_device is not None:
             recs.append(f"buffer_device={self.recommended_buffer_device!r}")

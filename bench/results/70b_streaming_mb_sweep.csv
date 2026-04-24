@@ -1,0 +1,6 @@
+model,n_samples,seq_len,microbatch,n_microbatches,wall_s,tok_s,per_layer_s,per_sample_us,total_load_s,total_fwd_s,total_cb_s,total_write_s,peak_vram_gb,n_layers
+meta-llama/Llama-3.3-70B-Instruct,1024,128,32,32,204.42,641.2,2.5552,199625.0,1.23,102.99,0.005,0.027,6.88,80
+meta-llama/Llama-3.3-70B-Instruct,1024,128,64,16,202.94,645.9,2.5367,198180.4,1.24,101.91,0.003,0.013,7.79,80
+meta-llama/Llama-3.3-70B-Instruct,1024,128,128,8,202.74,646.5,2.5342,197985.3,1.22,101.86,0.002,0.007,9.61,80
+meta-llama/Llama-3.3-70B-Instruct,1024,128,256,4,204.17,642.0,2.5521,199380.9,1.22,103.21,0.001,0.004,13.34,80
+meta-llama/Llama-3.3-70B-Instruct,1024,128,512,2,207.17,632.7,2.5896,202311.6,1.23,105.89,0.001,0.003,21.16,80

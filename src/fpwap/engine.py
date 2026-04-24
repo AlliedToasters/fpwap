@@ -61,6 +61,7 @@ class LayerTiming:
     write_s: float = 0.0
     bytes_weights: int = 0
     bytes_buffer: int = 0
+    peak_vram_bytes: int = 0
 
 
 @dataclass
@@ -134,10 +135,14 @@ class ProfileReport:
             lines.append(f"  loop  {self.loop_s:.3f}s")
         if self.teardown_s > 0:
             lines.append(f"  teardown {self.teardown_s:.3f}s")
+        peak = self.peak_vram_gb()
+        if peak > 0:
+            lines.append(f"  peak VRAM {peak:.1f} GB")
         for i, t in sorted(self.per_layer.items()):
+            vram_str = f"  vram {t.peak_vram_bytes / 1e9:.1f}GB" if t.peak_vram_bytes > 0 else ""
             lines.append(
                 f"  layer {i}: load {t.load_s:.3f}s  fwd {t.forward_s:.3f}s  "
-                f"cb {t.callback_s:.3f}s  write {t.write_s:.3f}s"
+                f"cb {t.callback_s:.3f}s  write {t.write_s:.3f}s{vram_str}"
             )
         return "\n".join(lines)
 
@@ -170,6 +175,12 @@ class ProfileReport:
                     worst_i = i
                     worst_phase = name.removesuffix("_s")
         return (worst_i, worst_phase)
+
+    def peak_vram_gb(self) -> float:
+        """Peak VRAM allocated across all layers, in GB."""
+        if not self.per_layer:
+            return 0.0
+        return max(t.peak_vram_bytes for t in self.per_layer.values()) / 1e9
 
     def bytes_moved(self) -> dict[str, int]:
         w = sum(t.bytes_weights for t in self.per_layer.values())
@@ -731,6 +742,9 @@ class Sweep:
             torch.cuda.synchronize()
         embed_s = (time.perf_counter_ns() - t_embed_0) / 1e9
 
+        if exec_device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+
         t_fwd_0 = time.perf_counter_ns()
         with torch.no_grad():
             _ = plumbing.layer_forward_with_hooks(
@@ -739,6 +753,10 @@ class Sweep:
         if exec_device.type == "cuda":
             torch.cuda.synchronize()
         fwd_per_microbatch_s = (time.perf_counter_ns() - t_fwd_0) / 1e9
+
+        probe_peak_vram_gb = 0.0
+        if exec_device.type == "cuda":
+            probe_peak_vram_gb = torch.cuda.max_memory_allocated() / 1e9
 
         streamer.unload_layer(model, 0, plumbing)
         del input_ids, hidden_states
@@ -782,7 +800,7 @@ class Sweep:
             feasible=True,
             microbatch_size=mb_size,
             residual_buffer_gb=residual_gb,
-            per_layer_peak_vram_gb=0.0,
+            per_layer_peak_vram_gb=probe_peak_vram_gb,
             estimated_wall_clock_s=rec.prediction.total_wall_s,
             estimated_weight_io_gb=est_weight_io_gb,
             loading_strategy="cpu_offload",
@@ -1240,7 +1258,16 @@ class Sweep:
             # wins from letting writes overlap with compute within the layer.
             if exec_device.type == "cuda":
                 torch.cuda.synchronize()
+                timing.peak_vram_bytes = torch.cuda.max_memory_allocated()
             _emit_progress("layer_end", layer_idx, n_batches, n_batches)
+
+            if hasattr(layer_iter, "set_postfix"):
+                elapsed = (time.perf_counter_ns() - t0_run) / 1e9
+                tps = profile.total_tokens / elapsed if elapsed > 0 else 0
+                postfix = {"tok/s": f"{tps:,.0f}"}
+                if timing.peak_vram_bytes > 0:
+                    postfix["VRAM"] = f"{timing.peak_vram_bytes / 1e9:.1f}GB"
+                layer_iter.set_postfix(postfix)
 
             for cb in self.callbacks:
                 layer_art = cb.on_layer_end(layer_idx)
