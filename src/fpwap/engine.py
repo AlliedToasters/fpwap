@@ -1447,7 +1447,9 @@ class Sweep:
                     ):
                         gap = self.seq_len - emit_tensor.shape[1]
                         pad_shape = (emit_tensor.shape[0], gap, *emit_tensor.shape[2:])
-                        z = torch.zeros(pad_shape, dtype=emit_tensor.dtype, device=emit_tensor.device)
+                        z = torch.zeros(
+                            pad_shape, dtype=emit_tensor.dtype, device=emit_tensor.device,
+                        )
                         emit_tensor = torch.cat([z, emit_tensor], dim=1)
                     self.storage.write_emit(
                         layer_idx, hook, sample_ids, emit_tensor
