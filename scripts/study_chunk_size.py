@@ -109,10 +109,8 @@ def main() -> None:
             nonlocal layers_done
             if event.kind == "layer_end":
                 layers_done = event.layer_idx + 1
-                elapsed = event.wall_s
-                tps = total_tokens * layers_done / (elapsed * 32) if elapsed > 0 else 0
                 print(
-                    f"  layer {event.layer_idx}  {elapsed:.1f}s",
+                    f"  layer {event.layer_idx}  {event.wall_s:.1f}s",
                     flush=True,
                 )
 
