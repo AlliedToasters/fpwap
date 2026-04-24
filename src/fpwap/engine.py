@@ -390,6 +390,20 @@ def _callback_applies(cb: Callback, layer_idx: int, hook: HookName) -> bool:
     return hook in cb.target_hooks
 
 
+def _max_capture_layer(callbacks: Sequence[Callback], n_layers: int) -> int:
+    """Deepest layer any callback needs.  Returns n_layers - 1 if any targets 'all'."""
+    if not callbacks:
+        return n_layers - 1
+    deepest = -1
+    for cb in callbacks:
+        if cb.target_layers == "all":
+            return n_layers - 1
+        for layer in cb.target_layers:
+            if layer > deepest:
+                deepest = layer
+    return deepest if deepest >= 0 else n_layers - 1
+
+
 def _stack_field(items: list[Any], key: str) -> Tensor:
     """Collate a slice of dataset items along `key` into a single `(mb, seq)` tensor."""
     parts: list[Tensor] = []
@@ -1101,6 +1115,14 @@ class Sweep:
         # Main loop: for each layer, for each microbatch.
         layer_modules = plumbing.layer_modules(model)
         n_layers = len(layer_modules)
+
+        # Lazy forward (#48): exit once all requested captures are emitted.
+        max_cap = _max_capture_layer(self.callbacks, n_layers)
+        effective_n_layers = min(max_cap + 1, n_layers)
+
+        if final_norm is not None and effective_n_layers < n_layers:
+            final_norm = None
+
         profile = ProfileReport()
 
         layer_iter: Any = None
@@ -1108,7 +1130,7 @@ class Sweep:
         if self.progress is True:
             from tqdm.auto import tqdm
 
-            layer_iter = tqdm(total=n_layers, desc="fpwap layers", dynamic_ncols=True)
+            layer_iter = tqdm(total=effective_n_layers, desc="fpwap layers", dynamic_ncols=True)
         elif callable(self.progress):
             progress_reporter = self.progress
 
@@ -1129,7 +1151,7 @@ class Sweep:
 
         # Chunk the layers: each chunk loads N layers at once, processes
         # all microbatches through all N layers, then unloads.
-        chunks = _make_chunks(n_layers, self.chunk_size)
+        chunks = _make_chunks(effective_n_layers, self.chunk_size)
 
         # When chunk_size > 1 and the buffer lives on a different device
         # from the execution device, we allocate a GPU-resident scratch
@@ -1182,7 +1204,7 @@ class Sweep:
                 # Prefetch next layer so its load overlaps with this layer's
                 # compute. Works across chunk boundaries: the last layer of
                 # this chunk prefetches the first layer of the next chunk.
-                if layer_idx + 1 < n_layers:
+                if layer_idx + 1 < effective_n_layers:
                     prefetch_future = streamer.prefetch_load(
                         model, layer_idx + 1, plumbing
                     )
