@@ -125,6 +125,7 @@ class _Shard:
     def read(self) -> Tensor:
         if self._mm is None:
             raise RuntimeError(f"shard {self.path.name!r} was never written to")
+        # _dirty intentionally not cleared: drain() still needs fadvise for eviction.
         self._mm.flush()
         arr = np.asarray(self._mm)
         t = torch.from_numpy(arr)
@@ -132,9 +133,6 @@ class _Shard:
             t = t.view(torch.bfloat16)
         return t
 
-    def flush(self) -> None:
-        if self._mm is not None:
-            self._mm.flush()
 
 
 class MemmapBackend:
@@ -190,5 +188,3 @@ class MemmapBackend:
 
     def on_sweep_end(self) -> None:
         self.drain_emits()
-        for shard in self._shards.values():
-            shard.flush()
