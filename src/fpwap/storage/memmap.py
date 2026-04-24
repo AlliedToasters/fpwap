@@ -13,6 +13,7 @@ on the SPEC §17 target workload (Llama-70B × 10k prompts × 128 tokens ≈
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ import torch
 from torch import Tensor
 
 from fpwap.types import HookName
+
+_HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 
 _TORCH_TO_NUMPY: dict[torch.dtype, Any] = {
     torch.float32: np.float32,
@@ -86,6 +89,27 @@ class _Shard:
         if self._stores_bf16_as_u16:
             host = host.view(torch.uint16)
         mm[ids_np] = host.numpy()
+        self._flush_and_evict()
+
+    def _flush_and_evict(self) -> None:
+        """Flush dirty pages to disk, then advise the kernel to reclaim them.
+
+        Emit shards are write-once-read-at-end; without this, written pages
+        stay hot in page cache for the entire sweep, stealing budget from
+        weight and residual streaming (see #50).
+        """
+        if self._mm is None:
+            return
+        self._mm.flush()
+        if _HAS_POSIX_FADVISE:
+            try:
+                fd = os.open(str(self.path), os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
 
     def read(self) -> Tensor:
         if self._mm is None:
