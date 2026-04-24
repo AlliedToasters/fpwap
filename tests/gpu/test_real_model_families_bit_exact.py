@@ -19,6 +19,7 @@ import pytest
 import torch
 
 MODELS = [
+    "meta-llama/Llama-3.1-8B-Instruct",
     "meta-llama/Llama-3.2-3B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.2",
     "Qwen/Qwen2.5-7B-Instruct",
