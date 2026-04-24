@@ -53,6 +53,7 @@ class _Shard:
         self.torch_dtype: torch.dtype | None = None
         self._np_dtype: Any = None
         self._stores_bf16_as_u16: bool = False
+        self._dirty: bool = False
 
     def _ensure(self, sample_tensor: Tensor) -> np.memmap:
         if self._mm is not None:
@@ -89,7 +90,17 @@ class _Shard:
         if self._stores_bf16_as_u16:
             host = host.view(torch.uint16)
         mm[ids_np] = host.numpy()
+        self._dirty = True
+
+    def drain(self) -> None:
+        """Flush dirty pages to disk and evict from page cache.
+
+        Called at chunk boundaries instead of per-microbatch (#61).
+        """
+        if not self._dirty:
+            return
         self._flush_and_evict()
+        self._dirty = False
 
     def _flush_and_evict(self) -> None:
         """Flush dirty pages to disk, then advise the kernel to reclaim them.
@@ -114,6 +125,7 @@ class _Shard:
     def read(self) -> Tensor:
         if self._mm is None:
             raise RuntimeError(f"shard {self.path.name!r} was never written to")
+        # _dirty intentionally not cleared: drain() still needs fadvise for eviction.
         self._mm.flush()
         arr = np.asarray(self._mm)
         t = torch.from_numpy(arr)
@@ -121,9 +133,6 @@ class _Shard:
             t = t.view(torch.bfloat16)
         return t
 
-    def flush(self) -> None:
-        if self._mm is not None:
-            self._mm.flush()
 
 
 class MemmapBackend:
@@ -173,6 +182,9 @@ class MemmapBackend:
             )
         return self._shards[key].read()
 
-    def on_sweep_end(self) -> None:
+    def drain_emits(self) -> None:
         for shard in self._shards.values():
-            shard.flush()
+            shard.drain()
+
+    def on_sweep_end(self) -> None:
+        self.drain_emits()

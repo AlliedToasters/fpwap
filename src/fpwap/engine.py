@@ -130,6 +130,7 @@ class ProfileReport:
     loop_setup_s: float = 0.0
     loop_s: float = 0.0
     drain_sync_s: float = 0.0
+    emit_drain_s: float = 0.0
     unload_s: float = 0.0
     teardown: TeardownTiming | None = None
 
@@ -205,6 +206,8 @@ class ProfileReport:
             loop_parts: list[str] = []
             if self.drain_sync_s > 0:
                 loop_parts.append(f"drain_sync {self.drain_sync_s:.3f}s")
+            if self.emit_drain_s > 0:
+                loop_parts.append(f"emit_drain {self.emit_drain_s:.3f}s")
             if self.unload_s > 0:
                 loop_parts.append(f"unload {self.unload_s:.3f}s")
             loop_detail = f"  (includes {', '.join(loop_parts)})" if loop_parts else ""
@@ -1500,6 +1503,11 @@ class Sweep:
             if exec_device.type == "cuda":
                 torch.cuda.synchronize()
             profile.drain_sync_s += (time.perf_counter_ns() - t0_drain) / 1e9
+
+            if self.storage is not None:
+                t0_edrain = time.perf_counter_ns()
+                self.storage.drain_emits()
+                profile.emit_drain_s += (time.perf_counter_ns() - t0_edrain) / 1e9
 
             _emit_progress("chunk_unload", -1, 0, 0)
             if self.progress is True:
