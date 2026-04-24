@@ -1,5 +1,6 @@
 from fpwap.callbacks.base import Callback
 from fpwap.engine import (
+    PreloopTiming,
     ProfileReport,
     Result,
     SetupTiming,
@@ -27,6 +28,7 @@ __all__ = [
     "Extractor",
     "LayerArtifact",
     "PreflightReport",
+    "PreloopTiming",
     "ProfileReport",
     "Result",
     "SetupTiming",
