@@ -46,7 +46,8 @@ class ResidualBuffer:
             if hasattr(os, "posix_madvise"):
                 try:
                     os.posix_madvise(
-                        self._mm.ctypes.data, self._mm.nbytes, os.POSIX_MADV_SEQUENTIAL
+                        self._mm.ctypes.data, self._mm.nbytes,
+                        os.POSIX_MADV_SEQUENTIAL,  # type: ignore[attr-defined]
                     )
                 except OSError:
                     pass
