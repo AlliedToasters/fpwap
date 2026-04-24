@@ -1473,7 +1473,7 @@ class Sweep:
                 if hasattr(layer_iter, "update"):
                     layer_iter.update(1)
 
-            _emit_progress("chunk_drain_sync", chunk.start, 0, 0)
+            _emit_progress("chunk_drain_sync", -1, 0, 0)
             if self.progress is True:
                 sys.stderr.write(
                     f"fpwap: draining async writes (chunk {chunk})...\n"
@@ -1484,7 +1484,7 @@ class Sweep:
                 torch.cuda.synchronize()
             profile.drain_sync_s += (time.perf_counter_ns() - t0_drain) / 1e9
 
-            _emit_progress("chunk_unload", chunk.start, 0, 0)
+            _emit_progress("chunk_unload", -1, 0, 0)
             if self.progress is True:
                 sys.stderr.write(
                     f"fpwap: unloading chunk {chunk} weights...\n"
