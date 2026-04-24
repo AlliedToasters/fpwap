@@ -61,6 +61,7 @@ class LayerTiming:
     forward_s: float = 0.0
     callback_s: float = 0.0
     write_s: float = 0.0
+    emit_s: float = 0.0
     bytes_weights: int = 0
     bytes_buffer: int = 0
 
@@ -222,9 +223,10 @@ class ProfileReport:
             detail = f"  ({', '.join(parts)})" if parts else ""
             lines.append(f"  teardown {td.total_s:.3f}s{detail}")
         for i, t in sorted(self.per_layer.items()):
+            emit_part = f"  emit {t.emit_s:.3f}s" if t.emit_s > 0 else ""
             lines.append(
                 f"  layer {i}: load {t.load_s:.3f}s  fwd {t.forward_s:.3f}s  "
-                f"cb {t.callback_s:.3f}s  write {t.write_s:.3f}s"
+                f"cb {t.callback_s:.3f}s  write {t.write_s:.3f}s{emit_part}"
             )
         return "\n".join(lines)
 
@@ -234,18 +236,20 @@ class ProfileReport:
             "forward": [],
             "callback": [],
             "write": [],
+            "emit": [],
         }
         for _, t in sorted(self.per_layer.items()):
             phases["load"].append(t.load_s)
             phases["forward"].append(t.forward_s)
             phases["callback"].append(t.callback_s)
             phases["write"].append(t.write_s)
+            phases["emit"].append(t.emit_s)
         return phases
 
     def slowest_layer(self) -> tuple[int, str]:
         if not self.per_layer:
             return (-1, "none")
-        phase_names = ("load_s", "forward_s", "callback_s", "write_s")
+        phase_names = ("load_s", "forward_s", "callback_s", "write_s", "emit_s")
         worst_i = -1
         worst_phase = "none"
         worst_s = -1.0
@@ -1353,13 +1357,14 @@ class Sweep:
                                 else None
                             )
                             if dispatch_residual_pre:
-                                hidden_states = self._dispatch_callbacks(
+                                hidden_states, _pre_emit = self._dispatch_callbacks(
                                     layer_idx,
                                     "residual_pre",
                                     hidden_states,
                                     sample_ids_exec,
                                     emits_sink=emits_sink,
                                 )
+                                timing.emit_s += _pre_emit
                             inline_dispatch = None
                             if needs_inline_sublayer_dispatch:
                                 def _inline(
@@ -1368,7 +1373,7 @@ class Sweep:
                                     _layer_idx: int = layer_idx,
                                     _sample_ids: Tensor = sample_ids_exec,
                                 ) -> Tensor:
-                                    return self._dispatch_callbacks(
+                                    t, _e = self._dispatch_callbacks(
                                         _layer_idx,
                                         hook_name,  # type: ignore[arg-type]
                                         tensor,
@@ -1376,6 +1381,7 @@ class Sweep:
                                         emits_sink=emits_sink,
                                         write_allowed=True,
                                     )
+                                    return t
 
                                 inline_dispatch = _inline
 
@@ -1393,8 +1399,9 @@ class Sweep:
                             hidden_states = final_norm(hidden_states)
 
                         t_cb = time.perf_counter_ns()
+                        mb_emit_s = 0.0
                         for sub_hook, sub_tensor in extras.items():
-                            self._dispatch_callbacks(
+                            _, _sub_emit = self._dispatch_callbacks(
                                 layer_idx,
                                 sub_hook,  # type: ignore[arg-type]
                                 sub_tensor,
@@ -1402,13 +1409,16 @@ class Sweep:
                                 emits_sink=emits_sink,
                                 write_allowed=False,
                             )
-                        hidden_states = self._dispatch_callbacks(
+                            mb_emit_s += _sub_emit
+                        hidden_states, _post_emit = self._dispatch_callbacks(
                             layer_idx,
                             "residual_post",
                             hidden_states,
                             sample_ids_exec,
                             emits_sink=emits_sink,
                         )
+                        mb_emit_s += _post_emit
+                        timing.emit_s += mb_emit_s
                         if verify_baseline is not None:
                             expected = verify_baseline[layer_idx][start:stop].to(
                                 device=hidden_states.device, dtype=hidden_states.dtype
@@ -1439,8 +1449,15 @@ class Sweep:
                             timing.bytes_buffer += (
                                 hidden_states.element_size() * hidden_states.numel()
                             )
-                        timing.write_s += (time.perf_counter_ns() - t_w) / 1e9
+                        mb_write_s = (time.perf_counter_ns() - t_w) / 1e9
+                        timing.write_s += mb_write_s
                         batch_counter += 1
+                        if is_last_in_chunk and hasattr(layer_iter, "set_postfix"):
+                            layer_iter.set_postfix({
+                                "mb": f"{batch_counter}/{n_batches}",
+                                "write": f"{mb_write_s * 1e3:.0f}ms",
+                                "emit": f"{mb_emit_s * 1e3:.0f}ms",
+                            })
                         _emit_progress(
                             "microbatch_end",
                             layer_idx,
@@ -1583,15 +1600,13 @@ class Sweep:
         sample_ids: Tensor,
         emits_sink: dict[tuple[int, str], list[tuple[Tensor, Tensor]]] | None = None,
         write_allowed: bool = True,
-    ) -> Tensor:
+    ) -> tuple[Tensor, float]:
         """Phase-ordered dispatch: read → write (sequential) → read_after_write.
 
-        Returns the (possibly modified) activations. When `write_allowed` is
-        False (sub-layer hooks: attn_out / mlp_out), a callback whose phase is
-        "write" and whose targets include this hook raises — threading a
-        modified sub-layer tensor back into the block mid-forward isn't
-        supported yet.
+        Returns (possibly modified activations, emit_write_seconds).
         """
+        emit_s = 0.0
+
         # read
         for cb in self.callbacks:
             if cb.phase != "read" or not _callback_applies(cb, layer_idx, hook):
@@ -1614,15 +1629,13 @@ class Sweep:
                             pad_shape, dtype=emit_tensor.dtype, device=emit_tensor.device,
                         )
                         emit_tensor = torch.cat([z, emit_tensor], dim=1)
+                    t0_emit = time.perf_counter_ns()
                     self.storage.write_emit(
                         layer_idx, hook, sample_ids, emit_tensor
                     )
+                    emit_s += (time.perf_counter_ns() - t0_emit) / 1e9
                 elif emits_sink is not None:
                     key = (layer_idx, hook)
-                    # Clone on capture: residual_pre Emits alias the residual
-                    # buffer (read_slice returns a view); the same slice gets
-                    # overwritten by this layer's residual_post write, which
-                    # would corrupt the captured tensor without this clone.
                     emits_sink.setdefault(key, []).append(
                         (
                             sample_ids.detach().to("cpu", copy=True),
@@ -1654,4 +1667,4 @@ class Sweep:
                     f"read_after_write-phase callback {type(cb).__name__} returned WriteBack"
                 )
 
-        return acts
+        return acts, emit_s
