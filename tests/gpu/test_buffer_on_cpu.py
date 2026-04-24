@@ -94,6 +94,7 @@ def test_cpu_buffer_gpu_exec_matches_naive() -> None:
         microbatch_size=4,
         buffer_device="cpu",  # KEY: buffer on host RAM
         seed=SEED,
+        apply_final_norm=False,
     )
     run.run()
 

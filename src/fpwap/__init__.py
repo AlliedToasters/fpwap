@@ -1,6 +1,7 @@
 from fpwap.callbacks.base import Callback
 from fpwap.engine import ProfileReport, Result, SetupTiming, Sweep, estimate_max_microbatch
 from fpwap.extractor import Extractor
+from fpwap.preflight import PreflightReport
 from fpwap.types import (
     Artifact,
     ArtifactKey,
@@ -18,6 +19,7 @@ __all__ = [
     "Emit",
     "Extractor",
     "LayerArtifact",
+    "PreflightReport",
     "ProfileReport",
     "Result",
     "SetupTiming",

@@ -99,6 +99,7 @@ def test_residual_post_matches_naive_on_cuda_bf16() -> None:
         callbacks=[cap],
         transport_dtype=torch.bfloat16,
         seed=SEED,
+        apply_final_norm=False,
     )
     result = run.run()
 

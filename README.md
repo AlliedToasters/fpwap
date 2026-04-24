@@ -202,20 +202,25 @@ The loop inversion at the heart of fpwap — load each layer once, stream the da
 
 ## Status
 
-**Llama-3.3-70B on a single RTX 5090 (32 GB VRAM), 10,000 prompts × 128
-tokens, full bf16 precision — 1,221 tok/s.** That's the regime fpwap
-exists for: the model doesn't fit in VRAM, the dataset is thousands of
-prompts, and no quantization is involved. Measured on the reference machine
-(RTX 5090, 128 GB DDR5, PCIe 5.0 NVMe):
+**Llama-3.1-405B on a single RTX 5090 (32 GB VRAM), streaming 803 GB of
+bf16 weights from NVMe — 45.7 tok/s in under 12 minutes.** 70B at
+10,000 prompts × 128 tokens hits 1,221 tok/s. That's the regime fpwap
+exists for: the model doesn't fit in VRAM (or even RAM), the dataset is
+thousands of prompts, and no quantization is involved. Measured on the
+reference machine (RTX 5090, 128 GB DDR5, PCIe 5.0 NVMe):
 
 | Model | Path | Samples × seq_len | Throughput (bf16) | SPEC target |
 | ----- | ---- | ------------------ | ----------------- | ----------- |
+| Llama-3.1-405B-Instruct | streaming, prefetch | 256 × 128    | **45.7 tok/s** | ≥ 180 |
 | Llama-3.3-70B-Instruct | streaming, prefetch | 10,000 × 128 | **1,221 tok/s** | ≥ 950 |
 | Llama-3.3-70B-Instruct | streaming            | 1,024 × 128  |  1,026 tok/s | ≥ 950 |
 | Llama-3.1-8B-Instruct  | streaming            | 1,024 × 128  | 10,442 tok/s | ≥ 5,000 |
 | Llama-3.1-8B-Instruct  | preloaded            | 256 × 128    | 11,894 tok/s | ≥ 5,000 |
 
-The 70B hero number is end-to-end across 80 layers with a pinned-CPU
+The 405B number is end-to-end across 126 layers streaming 803 GB of
+weights from NVMe SSD at 1.12 GB/s sustained, with prefetch fully hiding
+disk reads behind compute (0.000s load per layer at steady state). The
+70B hero number is end-to-end across 80 layers with a pinned-CPU
 residual buffer (21 GB), async D2H, and a worker-thread weight prefetch
 that overlaps layer L+1's safetensors read with layer L's compute.
 

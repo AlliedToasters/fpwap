@@ -127,6 +127,7 @@ def test_real_llama_1b_residual_post_bit_exact() -> None:
         # within a given microbatch_size is what we're verifying here.
         microbatch_size=N_SAMPLES,
         seed=0,
+        apply_final_norm=False,
     )
     sweep.run()
 

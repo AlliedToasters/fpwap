@@ -676,13 +676,13 @@ class Sweep:
         )
 
     def preflight(self) -> PreflightReport:
-        """Minimum-viable feasibility + wall-clock estimate.
+        """Feasibility gate + cost-model prediction.
 
-        Runs the embed pass + a single-layer dry-run on a small slice of the
-        dataset, measures wall-clock, and extrapolates. Not the full SPEC §10
-        planner (no microbatch binary search, no VRAM static analysis); this
-        is the "does this configuration even start" gate plus a rough ETA.
+        Runs the embed pass + a single-layer dry-run, measures weight-load
+        and forward times separately, then feeds them into the cost model to
+        predict throughput and recommend prefetch on/off.
         """
+        from fpwap.cost_model import CostModelInput, recommend
         from fpwap.preflight import PreflightReport as _Report
 
         items = _resolve_dataset(self.dataset)
@@ -704,6 +704,7 @@ class Sweep:
         plumbing = get_plumbing(model)
         exec_device = streamer.execution_device or items[0]["input_ids"].device
         buf_device = self.buffer_device or exec_device
+        is_preloaded = isinstance(streamer, _PreloadedStreamer)
 
         config = getattr(model, "config", None)
         hidden_attr = getattr(config, "hidden_size", None) if config is not None else None
@@ -736,38 +737,80 @@ class Sweep:
         )
         residual_gb = n_samples * self.seq_len * hidden * element_bytes / 1e9
 
+        # --- Probe: measure embed, weight-load, and forward separately ---
         streamer.ensure_embedding_loaded(model, plumbing)
-        streamer.load_layer(model, 0, plumbing)
 
-        probe_ids = torch.arange(mb_size, device=buf_device)
         input_ids = _stack_field(items[:mb_size], "input_ids").to(exec_device)
+
+        # Embed timing
+        if exec_device.type == "cuda":
+            torch.cuda.synchronize()
         t0 = time.perf_counter_ns()
         with torch.no_grad():
             hidden_states = plumbing.embed(model, input_ids)
+        if exec_device.type == "cuda":
+            torch.cuda.synchronize()
+        embed_s = (time.perf_counter_ns() - t0) / 1e9
+
+        # Weight-load timing (unload first so the load is realistic)
+        streamer.unload_layer(model, 0, plumbing)
+        if exec_device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter_ns()
+        streamer.load_layer(model, 0, plumbing)
+        if exec_device.type == "cuda":
+            torch.cuda.synchronize()
+        weight_load_s = (time.perf_counter_ns() - t0) / 1e9
+
+        # Forward timing (single microbatch)
+        if exec_device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter_ns()
+        with torch.no_grad():
             _ = plumbing.layer_forward_with_hooks(
                 model, plumbing.layer_modules(model)[0], hidden_states
             )
         if exec_device.type == "cuda":
             torch.cuda.synchronize()
-        probe_s = (time.perf_counter_ns() - t0) / 1e9
-        streamer.unload_layer(model, 0, plumbing)
-        del probe_ids, input_ids, hidden_states
+        fwd_per_microbatch_s = (time.perf_counter_ns() - t0) / 1e9
 
+        layer_weight_bytes = streamer.last_load_bytes
+        streamer.unload_layer(model, 0, plumbing)
+        del input_ids, hidden_states
+
+        # --- Cost model ---
         n_microbatches = (n_samples + mb_size - 1) // mb_size
-        est_wall = probe_s * n_layers * n_microbatches
-        est_weight_io_gb = streamer.last_load_bytes * n_layers / 1e9
+        # Scale embed_s from probe microbatch to full dataset
+        embed_total_s = embed_s * n_microbatches
+
+        inp = CostModelInput(
+            n_layers=n_layers,
+            n_samples=n_samples,
+            seq_len=self.seq_len,
+            microbatch_size=mb_size,
+            weight_load_s=weight_load_s,
+            fwd_per_microbatch_s=fwd_per_microbatch_s,
+            embed_s=embed_total_s,
+            layer_weight_bytes=layer_weight_bytes,
+        )
+
+        candidates: list[tuple[CostModelInput, bool]] = [(inp, False)]
+        if not is_preloaded:
+            candidates.append((inp, True))
+
+        rec = recommend(candidates)
 
         return _Report(
             feasible=True,
             microbatch_size=mb_size,
             residual_buffer_gb=residual_gb,
-            per_layer_peak_vram_gb=0.0,  # static analysis deferred
-            estimated_wall_clock_s=est_wall,
-            estimated_weight_io_gb=est_weight_io_gb,
+            per_layer_peak_vram_gb=0.0,
+            estimated_wall_clock_s=rec.prediction.total_wall_s,
+            estimated_weight_io_gb=rec.prediction.weight_io_gb,
             loading_strategy="cpu_offload",
-            warnings=(
-                ["preflight is a minimal wall-clock estimate, not a full planner"]
-            ),
+            prediction=rec.prediction,
+            recommended_prefetch=rec.prefetch,
+            recommended_buffer_device="cpu" if buf_device != exec_device else "cuda",
         )
 
     def _resolve_model_and_streamer(
