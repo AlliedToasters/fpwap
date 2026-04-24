@@ -9,7 +9,7 @@ from torch import nn
 
 from fpwap.callbacks.base import Callback
 from fpwap.storage import StorageBackend
-from fpwap.types import LoadingStrategy
+from fpwap.types import LoadingStrategy, PaddingMode
 
 if TYPE_CHECKING:
     from fpwap.engine import Sweep
@@ -83,6 +83,7 @@ class Extractor:
         buffer_device: torch.device | str | None = None,
         apply_final_norm: bool = True,
         chunk_size: int = 1,
+        padding: PaddingMode = "fixed",
     ) -> Sweep:
         """Create a Sweep that reuses this Extractor's model and index."""
         from fpwap.engine import Sweep
@@ -105,5 +106,6 @@ class Extractor:
             buffer_device=buffer_device,
             apply_final_norm=apply_final_norm,
             chunk_size=chunk_size,
+            padding=padding,
             _accel_index=self._accel_index,
         )
