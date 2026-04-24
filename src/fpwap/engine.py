@@ -4,6 +4,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
@@ -465,6 +466,7 @@ def _build_bucketed_segments(
     mb_size_override: int | None,
     config: Any,
     exec_device: torch.device,
+    buffer_path: Path | None = None,
 ) -> list[_Segment]:
     real_lengths: list[int] = []
     for item in items:
@@ -490,7 +492,10 @@ def _build_bucketed_segments(
         trimmed_items = [_trim_to_length(e[1], bseq, left_padded) for e in entries]
         n = len(trimmed_items)
 
-        buf = ResidualBuffer(n, bseq, hidden, transport_dtype, buf_device)
+        seg_path: Path | None = None
+        if buffer_path is not None:
+            seg_path = buffer_path.with_stem(f"{buffer_path.stem}_seq{bseq}")
+        buf = ResidualBuffer(n, bseq, hidden, transport_dtype, buf_device, path=seg_path)
         pin = buf_device.type == "cpu" and torch.cuda.is_available()
         mask_buf = torch.zeros(
             (n, bseq), dtype=torch.int64, device=buf_device, pin_memory=pin,
@@ -661,6 +666,7 @@ class Sweep:
         offload_dir: str | None = None,
         execution_device: torch.device | str | None = None,
         buffer_device: torch.device | str | None = None,
+        buffer_path: Any | None = None,
         apply_final_norm: bool = True,
         padding: PaddingMode = "fixed",
         chunk_size: int = 1,
@@ -689,6 +695,7 @@ class Sweep:
         self.buffer_device = (
             torch.device(buffer_device) if buffer_device is not None else None
         )
+        self.buffer_path = Path(buffer_path) if buffer_path is not None else None
 
     def preflight(self) -> PreflightReport:
         """Feasibility gate + cost-model prediction.
@@ -852,8 +859,6 @@ class Sweep:
                 raise ValueError(
                     "execution_device is required when model is a string ID"
                 )
-            from pathlib import Path
-
             from fpwap.loader import resolve_snapshot_dir
 
             t0_resolve = time.perf_counter_ns()
@@ -999,6 +1004,7 @@ class Sweep:
             segments = _build_bucketed_segments(
                 items, self.seq_len, hidden, self.transport_dtype,
                 buf_device, mb_override, config, exec_device,
+                buffer_path=self.buffer_path,
             )
         else:
             left_padded = True
@@ -1008,6 +1014,7 @@ class Sweep:
                 hidden=hidden,
                 dtype=self.transport_dtype,
                 device=buf_device,
+                path=self.buffer_path,
             )
             mask_pin = buf_device.type == "cpu" and torch.cuda.is_available()
             mask_buffer: Tensor | None = (
@@ -1349,6 +1356,8 @@ class Sweep:
             if art is not None:
                 artifacts[(art.key.kind, art.key.layer_idx)] = art
 
+        for seg in segments:
+            seg.buffer.flush()
         if self.storage is not None:
             self.storage.on_sweep_end()
         teardown_s = (time.perf_counter_ns() - t0_teardown) / 1e9

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -9,15 +10,12 @@ from torch import Tensor
 class ResidualBuffer:
     """Inter-layer transport for the fpwap loop.
 
-    For now, an in-memory tensor. Spec calls for NVMe-backed memmap so residual
-    state can exceed CPU RAM; that swap-in comes behind a unit test against
-    this same get/set contract (see SPEC §3.4).
-
-    When resident on CPU, the buffer is page-locked (`pin_memory=True`) so
-    `read_slice` / `write_slice` can issue genuinely async H2D / D2H copies
-    through the CUDA copy engine. Without that, D2H writes are stuck at
-    unpaged transfer rates (~3 GB/s on PCIe 5.0 vs ~40 GB/s pinned) and they
-    dominate the hero-scale wall-clock.
+    Two modes:
+    - In-memory (path=None): pinned torch tensor. Fast async D2H via the CUDA
+      copy engine. Default for workloads that fit in host RAM.
+    - Disk-backed (path=<file>): numpy memmap. The OS page cache manages
+      residency; the full [N, seq, H] corpus never needs to fit in RAM at once.
+      bf16 is stored as uint16 bit-patterns (numpy has no bf16 dtype).
     """
 
     def __init__(
@@ -35,40 +33,93 @@ class ResidualBuffer:
         self.dtype = dtype
         self.device = torch.device(device)
         self.path = path
-        pin = self.device.type == "cpu" and torch.cuda.is_available()
-        self._data: Tensor = torch.zeros(
-            (n_samples, seq_len, hidden),
-            dtype=dtype,
-            device=self.device,
-            pin_memory=pin,
-        )
+        self._shape = (n_samples, seq_len, hidden)
+
+        if path is not None:
+            self._bf16_as_u16 = dtype == torch.bfloat16
+            np_dtype = _torch_to_numpy(dtype)
+            self._np_dtype: type | None = np_dtype
+            self._mm: np.memmap | None = np.memmap(
+                path, dtype=np_dtype, mode="w+", shape=self._shape
+            )
+            self._data: Tensor | None = None
+        else:
+            self._bf16_as_u16 = False
+            self._np_dtype = None
+            self._mm = None
+            pin = self.device.type == "cpu" and torch.cuda.is_available()
+            self._data = torch.zeros(
+                self._shape, dtype=dtype, device=self.device, pin_memory=pin,
+            )
+
+    def _mm_to_tensor(self, arr: np.ndarray) -> Tensor:
+        t = torch.from_numpy(arr)
+        if self._bf16_as_u16:
+            t = t.view(torch.bfloat16)
+        return t
+
+    def _tensor_to_np(self, values: Tensor) -> np.ndarray:
+        host = values.detach().to(device="cpu", dtype=self.dtype)
+        if self._bf16_as_u16:
+            host = host.view(torch.uint16)
+        return host.numpy()
 
     def __getitem__(self, sample_ids: Tensor) -> Tensor:
-        return self._data[sample_ids]
+        if self._data is not None:
+            return self._data[sample_ids]
+        assert self._mm is not None
+        ids_np = sample_ids.detach().to(device="cpu", dtype=torch.int64).numpy()
+        return self._mm_to_tensor(np.asarray(self._mm[ids_np]).copy())
 
     def __setitem__(self, sample_ids: Tensor, values: Tensor) -> None:
-        self._data[sample_ids] = values.to(dtype=self.dtype, device=self.device)
+        if self._data is not None:
+            self._data[sample_ids] = values.to(dtype=self.dtype, device=self.device)
+            return
+        assert self._mm is not None
+        ids_np = sample_ids.detach().to(device="cpu", dtype=torch.int64).numpy()
+        self._mm[ids_np] = self._tensor_to_np(values)
 
     def read_slice(self, start: int, stop: int) -> Tensor:
-        """Contiguous view into the buffer — pinned when on CPU so callers
-        can chain `.to(exec_device, non_blocking=True)` for async H2D.
-        """
-        return self._data[start:stop]
+        if self._data is not None:
+            return self._data[start:stop]
+        assert self._mm is not None
+        return self._mm_to_tensor(np.asarray(self._mm[start:stop]).copy())
 
     def write_slice(self, start: int, stop: int, values: Tensor) -> None:
-        """Async in-place copy into the buffer slice `[start:stop]`.
-
-        On CPU-resident buffers this is a non-blocking D2H copy into pinned
-        memory; the caller is responsible for synchronizing on the exec
-        device's stream before reading the slice again (the engine does this
-        at layer boundaries).
-        """
-        if values.dtype != self.dtype:
-            values = values.to(dtype=self.dtype)
-        self._data[start:stop].copy_(values, non_blocking=True)
+        if self._data is not None:
+            if values.dtype != self.dtype:
+                values = values.to(dtype=self.dtype)
+            self._data[start:stop].copy_(values, non_blocking=True)
+            return
+        assert self._mm is not None
+        self._mm[start:stop] = self._tensor_to_np(values)
 
     def flush(self) -> None:
-        return None
+        if self._mm is not None:
+            self._mm.flush()
 
     def close(self) -> None:
-        return None
+        if self._mm is not None:
+            self._mm.flush()
+            del self._mm
+            self._mm = None
+
+
+_TORCH_TO_NUMPY = {
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.float16: np.float16,
+    torch.bfloat16: np.uint16,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.int16: np.int16,
+    torch.int8: np.int8,
+    torch.uint8: np.uint8,
+}
+
+
+def _torch_to_numpy(dtype: torch.dtype) -> type:
+    np_dtype = _TORCH_TO_NUMPY.get(dtype)
+    if np_dtype is None:
+        raise ValueError(f"unsupported dtype for memmap: {dtype}")
+    return np_dtype
