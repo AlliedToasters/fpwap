@@ -1,5 +1,12 @@
 from fpwap.callbacks.base import Callback
-from fpwap.engine import ProfileReport, Result, SetupTiming, Sweep, estimate_max_microbatch
+from fpwap.engine import (
+    ProfileReport,
+    Result,
+    SetupTiming,
+    Sweep,
+    TeardownTiming,
+    estimate_max_microbatch,
+)
 from fpwap.extractor import Extractor
 from fpwap.preflight import PreflightReport
 from fpwap.types import (
@@ -24,6 +31,7 @@ __all__ = [
     "Result",
     "SetupTiming",
     "Sweep",
+    "TeardownTiming",
     "WriteBack",
     "estimate_max_microbatch",
 ]
