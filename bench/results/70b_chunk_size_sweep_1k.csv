@@ -1,0 +1,4 @@
+model,n_samples,seq_len,microbatch,chunk_size,wall_s,tok_s,total_load_s,total_fwd_s,total_cb_s,total_write_s,total_buf_MB,n_layers
+meta-llama/Llama-3.3-70B-Instruct,1024,128,64,1,202.7,646.6,1.23,101.86,0.003,0.014,171798.7,80
+meta-llama/Llama-3.3-70B-Instruct,1024,128,64,2,199.95,655.5,1.22,100.08,0.003,0.013,85899.3,80
+meta-llama/Llama-3.3-70B-Instruct,1024,128,64,4,197.83,662.6,1.22,98.56,0.003,0.013,42949.7,80

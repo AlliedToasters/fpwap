@@ -82,6 +82,7 @@ class Extractor:
         execution_device: torch.device | str | None = None,
         buffer_device: torch.device | str | None = None,
         apply_final_norm: bool = True,
+        chunk_size: int = 1,
     ) -> Sweep:
         """Create a Sweep that reuses this Extractor's model and index."""
         from fpwap.engine import Sweep
@@ -103,5 +104,6 @@ class Extractor:
             execution_device=execution_device,
             buffer_device=buffer_device,
             apply_final_norm=apply_final_norm,
+            chunk_size=chunk_size,
             _accel_index=self._accel_index,
         )
