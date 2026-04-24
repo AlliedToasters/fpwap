@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,13 @@ class ResidualBuffer:
             self._mm: np.memmap | None = np.memmap(
                 path, dtype=np_dtype, mode="w+", shape=self._shape
             )
+            if hasattr(os, "posix_madvise"):
+                try:
+                    os.posix_madvise(
+                        self._mm.ctypes.data, self._mm.nbytes, os.POSIX_MADV_SEQUENTIAL
+                    )
+                except OSError:
+                    pass
             self._data: Tensor | None = None
         else:
             self._bf16_as_u16 = False

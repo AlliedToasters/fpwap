@@ -764,6 +764,16 @@ class Sweep:
 
         input_ids = _stack_field(items[:mb_size], "input_ids").to(exec_device)
 
+        # Warmup: untimed forward through embed + layer 0 to warm JIT/page cache
+        with torch.no_grad():
+            _warmup_hs = plumbing.embed(model, input_ids)
+            _ = plumbing.layer_forward_with_hooks(
+                model, plumbing.layer_modules(model)[0], _warmup_hs
+            )
+        del _warmup_hs
+        if exec_device.type == "cuda":
+            torch.cuda.synchronize()
+
         # Embed timing
         if exec_device.type == "cuda":
             torch.cuda.synchronize()
@@ -1408,8 +1418,17 @@ class Sweep:
                 )
             if isinstance(result, Emit):
                 if self.storage is not None:
+                    emit_tensor = result.tensor
+                    if (
+                        emit_tensor.dim() >= 2
+                        and emit_tensor.shape[1] < self.seq_len
+                    ):
+                        gap = self.seq_len - emit_tensor.shape[1]
+                        pad_shape = (emit_tensor.shape[0], gap, *emit_tensor.shape[2:])
+                        z = torch.zeros(pad_shape, dtype=emit_tensor.dtype, device=emit_tensor.device)
+                        emit_tensor = torch.cat([z, emit_tensor], dim=1)
                     self.storage.write_emit(
-                        layer_idx, hook, sample_ids, result.tensor
+                        layer_idx, hook, sample_ids, emit_tensor
                     )
                 elif emits_sink is not None:
                     key = (layer_idx, hook)
