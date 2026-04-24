@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from fpwap.callbacks.base import Callback
+from fpwap.cost_model import CostModelPrediction
 from fpwap.types import LoadingStrategy
 
 
@@ -21,6 +22,50 @@ class PreflightReport:
     loading_strategy: LoadingStrategy
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    prediction: CostModelPrediction | None = None
+    recommended_prefetch: bool | None = None
+    recommended_buffer_device: str | None = None
+
+    def summary(self) -> str:
+        lines: list[str] = []
+        if self.feasible:
+            lines.append("feasible")
+        else:
+            lines.append("not feasible")
+            for b in self.blockers:
+                lines.append(f"  blocker: {b}")
+            return "\n".join(lines)
+
+        lines.append(
+            f"  microbatch_size={self.microbatch_size}  "
+            f"residual_buffer={self.residual_buffer_gb:.2f} GB  "
+            f"weight_io={self.estimated_weight_io_gb:.1f} GB"
+        )
+
+        if self.prediction is not None:
+            p = self.prediction
+            lines.append(
+                f"  predicted throughput {p.throughput_tok_s:,.1f} tok/s  "
+                f"wall {p.total_wall_s:.1f}s  "
+                f"bottleneck={p.bottleneck}"
+            )
+            lines.append(
+                f"  load {p.load_pct:.0%}  compute {p.compute_pct:.0%}"
+            )
+        else:
+            lines.append(f"  estimated wall {self.estimated_wall_clock_s:.1f}s")
+
+        if self.recommended_prefetch is not None:
+            lines.append(f"  recommended: prefetch={self.recommended_prefetch}")
+        if self.recommended_buffer_device is not None:
+            lines.append(
+                f"  recommended: buffer_device={self.recommended_buffer_device}"
+            )
+
+        for w in self.warnings:
+            lines.append(f"  warning: {w}")
+
+        return "\n".join(lines)
 
 
 def _select_loading_strategy(
