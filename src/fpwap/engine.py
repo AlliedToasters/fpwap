@@ -183,6 +183,8 @@ class Result:
     artifacts: dict[tuple[str, int], Artifact] = field(default_factory=dict)
     storage: StorageBackend | None = None
     profile: ProfileReport = field(default_factory=ProfileReport)
+    seq_len: int | None = None
+    _left_padded: bool = True
     # When no StorageBackend is set, Emit outputs are collected in memory per
     # (layer, hook). Fine for moderate-size sweeps; for dataset-scale
     # extraction, swap in a storage backend to avoid RAM pressure.
@@ -212,6 +214,19 @@ class Result:
         parts = self._emits[key]
         ordered = sorted(parts, key=lambda p: int(p[0][0]))
         tensors = [t for _, t in ordered]
+        if tensors and tensors[0].dim() >= 2:
+            seq_dims = {t.shape[1] for t in tensors}
+            if len(seq_dims) > 1:
+                target = self.seq_len if self.seq_len is not None else max(seq_dims)
+                padded = []
+                for t in tensors:
+                    gap = target - t.shape[1]
+                    if gap > 0:
+                        pad_shape = (t.shape[0], gap, *t.shape[2:])
+                        z = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+                        t = torch.cat([z, t] if self._left_padded else [t, z], dim=1)
+                    padded.append(t)
+                tensors = padded
         return torch.cat(tensors, dim=0)
 
 
@@ -979,12 +994,14 @@ class Sweep:
                     UserWarning,
                     stacklevel=2,
                 )
+            left_padded = _detect_left_padding(items)
             mb_override: int | None = None if self.microbatch_size == "auto" else mb_size
             segments = _build_bucketed_segments(
                 items, self.seq_len, hidden, self.transport_dtype,
                 buf_device, mb_override, config, exec_device,
             )
         else:
+            left_padded = True
             buffer = ResidualBuffer(
                 n_samples=n_samples,
                 seq_len=self.seq_len,
@@ -1349,6 +1366,8 @@ class Sweep:
             artifacts=artifacts,
             storage=self.storage,
             profile=profile,
+            seq_len=self.seq_len,
+            _left_padded=left_padded,
             _emits=emits_sink,
         )
 
