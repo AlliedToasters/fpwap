@@ -206,6 +206,36 @@ def test_bucketed_matches_per_bucket_naive() -> None:
 
 
 @pytest.mark.integration
+def test_bucketed_result_activations_reassembles() -> None:
+    """result.activations() produces [N, seq_len, H] from bucketed emits."""
+    from fpwap import Sweep
+    from fpwap.callbacks.common import RawActivations
+
+    model = _tiny_gpt2()
+    items = _mixed_length_dataset()
+
+    raw = RawActivations(layers="all", last_token_only=False, out_dtype=torch.float32)
+    sweep = Sweep(
+        model=model,
+        dataset=items,
+        seq_len=SEQ_LEN,
+        callbacks=[raw],
+        transport_dtype=torch.float32,
+        padding="bucketed",
+        apply_final_norm=False,
+    )
+    result = sweep.run()
+
+    for layer_idx in range(N_LAYERS):
+        acts = result.activations(layer_idx, "residual_post")
+        assert acts.shape == (N_SAMPLES, SEQ_LEN, HIDDEN), (
+            f"layer {layer_idx}: expected ({N_SAMPLES}, {SEQ_LEN}, {HIDDEN}), "
+            f"got {tuple(acts.shape)}"
+        )
+        assert torch.isfinite(acts).all()
+
+
+@pytest.mark.integration
 
 def test_bucketed_warns_learned_positions() -> None:
     """padding='bucketed' emits a UserWarning for GPT-2 (learned positional embeddings)."""
