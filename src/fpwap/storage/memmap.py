@@ -116,9 +116,10 @@ class _Shard:
             raise RuntimeError(f"shard {self.path.name!r} was never written to")
         self._mm.flush()
         arr = np.asarray(self._mm)
+        t = torch.from_numpy(arr)
         if self._stores_bf16_as_u16:
-            return torch.from_numpy(arr.copy()).view(torch.bfloat16)
-        return torch.from_numpy(arr.copy())
+            t = t.view(torch.bfloat16)
+        return t
 
     def flush(self) -> None:
         if self._mm is not None:
