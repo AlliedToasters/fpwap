@@ -81,6 +81,22 @@ class SetupTiming:
 
 
 @dataclass
+class PreloopTiming:
+    """Breakdown of the pre-loop phase between run() entry and embedding.
+
+    Captures where wall-clock goes during dataset resolution, embedding
+    weight loading, buffer/segment allocation, and callback initialization.
+    """
+
+    resolve_dataset_s: float = 0.0
+    ensure_embedding_s: float = 0.0
+    build_segments_s: float = 0.0
+    storage_start_s: float = 0.0
+    callbacks_start_s: float = 0.0
+    total_s: float = 0.0
+
+
+@dataclass
 class TeardownTiming:
     """Breakdown of the teardown phase after the main loop completes.
 
@@ -107,9 +123,20 @@ class ProfileReport:
     total_tokens: int = 0
     per_layer: dict[int, LayerTiming] = field(default_factory=dict)
     setup: SetupTiming | None = None
+    preloop: PreloopTiming | None = None
     embed_s: float = 0.0
+    embed_sync_s: float = 0.0
+    loop_setup_s: float = 0.0
     loop_s: float = 0.0
+    drain_sync_s: float = 0.0
+    unload_s: float = 0.0
     teardown: TeardownTiming | None = None
+
+    @property
+    def preloop_s(self) -> float:
+        if self.preloop is None:
+            return 0.0
+        return self.preloop.total_s
 
     @property
     def teardown_s(self) -> float:
@@ -151,10 +178,36 @@ class ProfileReport:
                 f"(resolve {s.resolve_s:.3f}s  config {s.config_s:.3f}s  "
                 f"model {s.model_s:.3f}s  index {s.index_s:.3f}s)"
             )
+        if self.preloop is not None and self.preloop.total_s > 0:
+            pl = self.preloop
+            pl_parts: list[str] = []
+            for name, val in [
+                ("resolve_dataset", pl.resolve_dataset_s),
+                ("ensure_embedding", pl.ensure_embedding_s),
+                ("build_segments", pl.build_segments_s),
+                ("storage_start", pl.storage_start_s),
+                ("callbacks_start", pl.callbacks_start_s),
+            ]:
+                if val > 0:
+                    pl_parts.append(f"{name} {val:.3f}s")
+            pl_detail = f"  ({', '.join(pl_parts)})" if pl_parts else ""
+            lines.append(f"  preloop {pl.total_s:.3f}s{pl_detail}")
         if self.embed_s > 0:
-            lines.append(f"  embed {self.embed_s:.3f}s")
+            embed_parts: list[str] = []
+            if self.embed_sync_s > 0:
+                embed_parts.append(f"sync {self.embed_sync_s:.3f}s")
+            embed_detail = f"  (includes {', '.join(embed_parts)})" if embed_parts else ""
+            lines.append(f"  embed {self.embed_s:.3f}s{embed_detail}")
+        if self.loop_setup_s > 0:
+            lines.append(f"  loop_setup {self.loop_setup_s:.3f}s")
         if self.loop_s > 0:
-            lines.append(f"  loop  {self.loop_s:.3f}s")
+            loop_parts: list[str] = []
+            if self.drain_sync_s > 0:
+                loop_parts.append(f"drain_sync {self.drain_sync_s:.3f}s")
+            if self.unload_s > 0:
+                loop_parts.append(f"unload {self.unload_s:.3f}s")
+            loop_detail = f"  (includes {', '.join(loop_parts)})" if loop_parts else ""
+            lines.append(f"  loop  {self.loop_s:.3f}s{loop_detail}")
         if self.teardown is not None and self.teardown.total_s > 0:
             td = self.teardown
             parts: list[str] = []
@@ -959,22 +1012,49 @@ class Sweep:
                 "tests instead."
             )
         t0_run = time.perf_counter_ns()
+
+        # Set up progress reporter early so pre-loop events are visible.
+        progress_reporter: ProgressReporter | None = None
+        if callable(self.progress):
+            progress_reporter = self.progress
+
+        def _emit_progress(
+            kind: str, layer_idx: int, batch_idx: int, n_batches: int
+        ) -> None:
+            if progress_reporter is None:
+                return
+            progress_reporter(
+                ProgressEvent(
+                    kind=kind,
+                    layer_idx=layer_idx,
+                    batch_idx=batch_idx,
+                    n_batches=n_batches,
+                    wall_s=(time.perf_counter_ns() - t0_run) / 1e9,
+                )
+            )
+
+        # --- Pre-loop: timed per sub-phase ---
+        pl = PreloopTiming()
+        t0_preloop = time.perf_counter_ns()
+
         model, streamer, setup_timing = self._resolve_model_and_streamer()
-        model.eval()  # fpwap is inference-only; dropout/etc. must be off.
+        model.eval()
         plumbing = get_plumbing(model)
 
+        _emit_progress("preloop_resolve_dataset", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: resolving dataset...\n")
+            sys.stderr.flush()
+        t0 = time.perf_counter_ns()
         items = _resolve_dataset(self.dataset)
         n_samples = len(items)
         if n_samples == 0:
             raise ValueError("fpwap dataset is empty")
-
         first_ids = items[0]["input_ids"]
         exec_device = streamer.execution_device or first_ids.device
         buf_device = self.buffer_device or exec_device
-
         config = getattr(model, "config", None)
         hidden_attr = getattr(config, "hidden_size", None) if config is not None else None
-
         if self.microbatch_size == "auto":
             if isinstance(buf_device, torch.device):
                 buf_on_gpu = buf_device.type == "cuda"
@@ -996,10 +1076,6 @@ class Sweep:
             mb_size = self.microbatch_size
         else:
             mb_size = n_samples
-
-        # verify=True: one-shot naive forward over the dataset, capturing
-        # every block's residual_post. The main loop diffs its output
-        # per-microbatch against this baseline (fail-fast).
         verify_baseline: dict[int, Tensor] | None = None
         if self.verify:
             verify_baseline = _run_naive_baseline(
@@ -1010,19 +1086,21 @@ class Sweep:
                 "model.config.hidden_size is required to size the residual buffer"
             )
         hidden = int(hidden_attr)
+        pl.resolve_dataset_s = (time.perf_counter_ns() - t0) / 1e9
 
-        # Streaming path: load pass-0 embedding weights onto the execution device.
+        _emit_progress("preloop_ensure_embedding", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: loading embedding weights...\n")
+            sys.stderr.flush()
+        t0 = time.perf_counter_ns()
         streamer.ensure_embedding_loaded(model, plumbing)
-
-        # If apply_final_norm is set, resolve the norm module and ensure its
-        # params are on the execution device (streaming path loads them here;
-        # preloaded path already has them resident).
         final_norm: nn.Module | None = None
         if self.apply_final_norm:
             final_norm = plumbing.final_norm_module(model)
             if final_norm is not None and isinstance(streamer, _OffloadStreamer):
                 for name in plumbing.final_norm_param_names(model):
                     _load_named_param(model, name, streamer._loader, exec_device)
+        pl.ensure_embedding_s = (time.perf_counter_ns() - t0) / 1e9
 
         sweep_id = uuid.uuid4().hex[:12]
         ctx = Context(
@@ -1035,7 +1113,11 @@ class Sweep:
 
         has_mask = _has_attention_mask(items)
 
-        # Build segments: one per bucket in bucketed mode, one total in fixed.
+        _emit_progress("preloop_build_segments", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: building segments and buffers...\n")
+            sys.stderr.flush()
+        t0 = time.perf_counter_ns()
         if self.padding == "bucketed":
             if not has_mask:
                 raise ValueError(
@@ -1092,18 +1174,35 @@ class Sweep:
                 mask_buffer=mask_buffer,
                 mb_size=mb_size,
             )]
+        pl.build_segments_s = (time.perf_counter_ns() - t0) / 1e9
 
-        # Emit sink: storage backend (disk) if wired, else in-memory.
         emits_sink: dict[tuple[int, str], list[tuple[Tensor, Tensor]]] = {}
-        # Per-layer artifacts from on_layer_end returns, merged with on_sweep_end
-        # artifacts at run end. Both land in Result.artifacts keyed by (kind, layer).
         layer_artifacts: dict[tuple[str, int], Artifact] = {}
+
+        _emit_progress("preloop_storage_start", -1, 0, 0)
+        t0 = time.perf_counter_ns()
         if self.storage is not None:
             self.storage.on_sweep_start(sweep_id, n_samples)
+        pl.storage_start_s = (time.perf_counter_ns() - t0) / 1e9
 
+        _emit_progress("preloop_callbacks_start", -1, 0, 0)
+        t0 = time.perf_counter_ns()
         for cb in self.callbacks:
             cb.on_sweep_start(ctx)
+        pl.callbacks_start_s = (time.perf_counter_ns() - t0) / 1e9
 
+        pl.total_s = (time.perf_counter_ns() - t0_preloop) / 1e9
+        _emit_progress("preloop_end", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write(
+                f"fpwap: preloop complete ({pl.total_s:.1f}s)\n"
+            )
+            sys.stderr.flush()
+
+        _emit_progress("embed_start", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: embedding pass...\n")
+            sys.stderr.flush()
         t0_embed = time.perf_counter_ns()
 
         # Pass 0: embedding over the whole dataset. Contiguous write_slice
@@ -1121,13 +1220,16 @@ class Sweep:
                         seg.mask_buffer[start:stop] = _stack_field(
                             seg.items[start:stop], "attention_mask"
                         ).to(dtype=torch.int64)
+        t0_embed_sync = time.perf_counter_ns()
         if exec_device.type == "cuda":
             torch.cuda.synchronize()
+        embed_sync_s = (time.perf_counter_ns() - t0_embed_sync) / 1e9
         embed_s = (time.perf_counter_ns() - t0_embed) / 1e9
+        _emit_progress("embed_end", -1, 0, 0)
 
-        # Which hooks do any callbacks care about? Drives whether to take the
-        # fast-path (direct block forward) or decompose the block to expose
-        # attn_out / mlp_out, and whether to dispatch residual_pre at all.
+        # --- Loop setup: hook computation, tqdm init, chunk building ---
+        t0_loop_setup = time.perf_counter_ns()
+
         wanted_hooks: set[str] = set()
         for cb in self.callbacks:
             for h in cb.target_hooks:
@@ -1136,20 +1238,15 @@ class Sweep:
             wanted_hooks & {"attn_out", "mlp_out"}
         )
         dispatch_residual_pre = "residual_pre" in wanted_hooks
-        # If any write-phase callback targets a sub-layer hook, we need to
-        # thread a dispatcher into the plumbing so the WriteBack takes effect
-        # mid-block (instead of being applied uselessly after residual add).
         needs_inline_sublayer_dispatch = any(
             cb.phase == "write"
             and any(h in {"attn_out", "mlp_out"} for h in cb.target_hooks)
             for cb in self.callbacks
         )
 
-        # Main loop: for each layer, for each microbatch.
         layer_modules = plumbing.layer_modules(model)
         n_layers = len(layer_modules)
 
-        # Lazy forward (#48): exit once all requested captures are emitted.
         max_cap = _max_capture_layer(self.callbacks, n_layers)
         effective_n_layers = min(max_cap + 1, n_layers)
 
@@ -1159,31 +1256,13 @@ class Sweep:
         profile = ProfileReport()
 
         layer_iter: Any = None
-        progress_reporter: ProgressReporter | None = None
         if self.progress is True:
             from tqdm.auto import tqdm
 
             layer_iter = tqdm(total=effective_n_layers, desc="fpwap layers", dynamic_ncols=True)
-        elif callable(self.progress):
-            progress_reporter = self.progress
 
-        def _emit_progress(
-            kind: str, layer_idx: int, batch_idx: int, n_batches: int
-        ) -> None:
-            if progress_reporter is None:
-                return
-            progress_reporter(
-                ProgressEvent(
-                    kind=kind,
-                    layer_idx=layer_idx,
-                    batch_idx=batch_idx,
-                    n_batches=n_batches,
-                    wall_s=(time.perf_counter_ns() - t0_run) / 1e9,
-                )
-            )
+        loop_setup_s = (time.perf_counter_ns() - t0_loop_setup) / 1e9
 
-        # Chunk the layers: each chunk loads N layers at once, processes
-        # all microbatches through all N layers, then unloads.
         chunks = _make_chunks(effective_n_layers, self.chunk_size)
 
         # When chunk_size > 1 and the buffer lives on a different device
@@ -1394,17 +1473,29 @@ class Sweep:
                 if hasattr(layer_iter, "update"):
                     layer_iter.update(1)
 
-            # Drain pending async D2H writes so the next chunk's reads see
-            # a coherent buffer.
+            _emit_progress("chunk_drain_sync", chunk.start, 0, 0)
+            if self.progress is True:
+                sys.stderr.write(
+                    f"fpwap: draining async writes (chunk {chunk})...\n"
+                )
+                sys.stderr.flush()
+            t0_drain = time.perf_counter_ns()
             if exec_device.type == "cuda":
                 torch.cuda.synchronize()
+            profile.drain_sync_s += (time.perf_counter_ns() - t0_drain) / 1e9
 
-            # Free GPU scratch before unloading weights.
+            _emit_progress("chunk_unload", chunk.start, 0, 0)
+            if self.progress is True:
+                sys.stderr.write(
+                    f"fpwap: unloading chunk {chunk} weights...\n"
+                )
+                sys.stderr.flush()
+            t0_unload = time.perf_counter_ns()
             if gpu_scratch:
                 del gpu_scratch
-
             for li in chunk:
                 streamer.unload_layer(model, li, plumbing)
+            profile.unload_s += (time.perf_counter_ns() - t0_unload) / 1e9
 
         if layer_iter is not None and hasattr(layer_iter, "close"):
             layer_iter.close()
@@ -1468,7 +1559,10 @@ class Sweep:
             seg.n_samples * seg.seq_len for seg in segments
         )
         profile.setup = setup_timing
+        profile.preloop = pl
         profile.embed_s = embed_s
+        profile.embed_sync_s = embed_sync_s
+        profile.loop_setup_s = loop_setup_s
         profile.loop_s = loop_s
         profile.teardown = td
         return Result(
