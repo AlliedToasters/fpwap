@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
@@ -80,6 +81,21 @@ class SetupTiming:
 
 
 @dataclass
+class TeardownTiming:
+    """Breakdown of the teardown phase after the main loop completes.
+
+    Captures where wall-clock goes during streamer shutdown, callback
+    finalization, residual buffer flush, and storage backend flush.
+    """
+
+    streamer_close_s: float = 0.0
+    callbacks_s: float = 0.0
+    buffer_flush_s: float = 0.0
+    storage_flush_s: float = 0.0
+    total_s: float = 0.0
+
+
+@dataclass
 class ProfileReport:
     """Always-on profile of an fpwap run. Target overhead: < 1% wall-clock.
 
@@ -93,7 +109,13 @@ class ProfileReport:
     setup: SetupTiming | None = None
     embed_s: float = 0.0
     loop_s: float = 0.0
-    teardown_s: float = 0.0
+    teardown: TeardownTiming | None = None
+
+    @property
+    def teardown_s(self) -> float:
+        if self.teardown is None:
+            return 0.0
+        return self.teardown.total_s
 
     def throughput_tok_per_s(self) -> float:
         """End-to-end tokens per second — total tokens (N * seq_len) divided
@@ -133,8 +155,19 @@ class ProfileReport:
             lines.append(f"  embed {self.embed_s:.3f}s")
         if self.loop_s > 0:
             lines.append(f"  loop  {self.loop_s:.3f}s")
-        if self.teardown_s > 0:
-            lines.append(f"  teardown {self.teardown_s:.3f}s")
+        if self.teardown is not None and self.teardown.total_s > 0:
+            td = self.teardown
+            parts: list[str] = []
+            for name, val in [
+                ("streamer_close", td.streamer_close_s),
+                ("callbacks", td.callbacks_s),
+                ("buffer_flush", td.buffer_flush_s),
+                ("storage_flush", td.storage_flush_s),
+            ]:
+                if val > 0:
+                    parts.append(f"{name} {val:.3f}s")
+            detail = f"  ({', '.join(parts)})" if parts else ""
+            lines.append(f"  teardown {td.total_s:.3f}s{detail}")
         for i, t in sorted(self.per_layer.items()):
             lines.append(
                 f"  layer {i}: load {t.load_s:.3f}s  fwd {t.forward_s:.3f}s  "
@@ -1378,21 +1411,57 @@ class Sweep:
 
         loop_s = (time.perf_counter_ns() - t0_loop) / 1e9
 
-        # Drain the prefetch pool so the worker thread exits cleanly.
+        # --- Teardown: timed per sub-phase, with progress events ---
+        td = TeardownTiming()
         t0_teardown = time.perf_counter_ns()
-        streamer.close()
 
+        _emit_progress("teardown_streamer_close", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: flushing (streamer close)...\n")
+            sys.stderr.flush()
+        t0 = time.perf_counter_ns()
+        streamer.close()
+        td.streamer_close_s = (time.perf_counter_ns() - t0) / 1e9
+
+        _emit_progress("teardown_callbacks", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: flushing (callbacks)...\n")
+            sys.stderr.flush()
+        t0 = time.perf_counter_ns()
         artifacts: dict[tuple[str, int], Artifact] = dict(layer_artifacts)
         for cb in self.callbacks:
             art = cb.on_sweep_end()
             if art is not None:
                 artifacts[(art.key.kind, art.key.layer_idx)] = art
+        td.callbacks_s = (time.perf_counter_ns() - t0) / 1e9
 
+        _emit_progress("teardown_buffer_flush", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: flushing (residual buffer)...\n")
+            sys.stderr.flush()
+        t0 = time.perf_counter_ns()
         for seg in segments:
             seg.buffer.flush()
+        td.buffer_flush_s = (time.perf_counter_ns() - t0) / 1e9
+
+        _emit_progress("teardown_storage_flush", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write("fpwap: flushing (storage backend)...\n")
+            sys.stderr.flush()
+        t0 = time.perf_counter_ns()
         if self.storage is not None:
             self.storage.on_sweep_end()
-        teardown_s = (time.perf_counter_ns() - t0_teardown) / 1e9
+        td.storage_flush_s = (time.perf_counter_ns() - t0) / 1e9
+
+        td.total_s = (time.perf_counter_ns() - t0_teardown) / 1e9
+        _emit_progress("teardown_end", -1, 0, 0)
+        if self.progress is True:
+            sys.stderr.write(
+                f"fpwap: teardown complete ({td.total_s:.1f}s: "
+                f"buffer_flush {td.buffer_flush_s:.1f}s, "
+                f"storage_flush {td.storage_flush_s:.1f}s)\n"
+            )
+            sys.stderr.flush()
 
         profile.total_wall_s = (time.perf_counter_ns() - t0_run) / 1e9
         profile.total_tokens = sum(
@@ -1401,7 +1470,7 @@ class Sweep:
         profile.setup = setup_timing
         profile.embed_s = embed_s
         profile.loop_s = loop_s
-        profile.teardown_s = teardown_s
+        profile.teardown = td
         return Result(
             sweep_id=sweep_id,
             artifacts=artifacts,

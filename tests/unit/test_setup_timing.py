@@ -1,7 +1,7 @@
 """Unit tests for SetupTiming and full-phase ProfileReport profiling."""
 from __future__ import annotations
 
-from fpwap.engine import LayerTiming, ProfileReport, SetupTiming
+from fpwap.engine import LayerTiming, ProfileReport, SetupTiming, TeardownTiming
 
 
 def test_setup_timing_fields() -> None:
@@ -45,7 +45,7 @@ def test_profile_report_phases_attached() -> None:
         total_tokens=1000,
         embed_s=0.5,
         loop_s=8.0,
-        teardown_s=0.1,
+        teardown=TeardownTiming(total_s=0.1),
     )
     assert r.embed_s == 0.5
     assert r.loop_s == 8.0
@@ -84,7 +84,7 @@ def test_summary_includes_embed_and_loop() -> None:
         per_layer={0: LayerTiming()},
         embed_s=0.5,
         loop_s=8.0,
-        teardown_s=0.1,
+        teardown=TeardownTiming(total_s=0.1),
     )
     s = r.summary()
     assert "embed 0.500s" in s
