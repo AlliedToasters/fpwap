@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from fpwap.types import HookName
+from fpwap.types import HookName, RaggedTensor
 
 _HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 
@@ -43,7 +43,17 @@ def _shard_basename(layer_idx: int, hook: HookName) -> str:
 
 
 class _Shard:
-    """One memmap file + its per-row shape/dtype, lazily sized."""
+    """One memmap file + its per-row shape/dtype, lazily sized.
+
+    Two layouts, decided on first write and locked thereafter:
+
+    * **dense** — `[n_samples, *per_row_shape]`. Default, writes by sample_id.
+    * **ragged** (#65) — variable-length per sample. On write, the flat
+      `[sum(sample_lengths), *trailing]` chunk is appended to a temporary
+      `.raw.bin` and a per-arrival metadata row is recorded. At drain/read
+      time the data is reordered into sample-id order in the final `.bin`,
+      and `read()` returns a `RaggedTensor`.
+    """
 
     def __init__(
         self, path: Path, n_samples: int, max_staging_bytes: int = 0
@@ -62,6 +72,18 @@ class _Shard:
         self._max_staging_rows: int = 0
         self._staging_cursor: int = 0
         self._pending: list[tuple[np.ndarray, int, int]] = []
+
+        # Ragged-layout state (None until first write determines layout).
+        self._layout: str | None = None  # "dense" | "ragged"
+        self._raw_path: Path = path.with_suffix(".raw.bin")
+        self._raw_mm: np.memmap | None = None
+        self._raw_capacity_rows: int = 0
+        self._raw_cursor: int = 0
+        self._sample_raw_offsets: np.ndarray | None = None  # int64[n_samples]
+        self._sample_lengths_arr: np.ndarray | None = None  # int64[n_samples]
+        self._sample_written: np.ndarray | None = None  # bool[n_samples]
+        self._final_built: bool = False
+        self._final_offsets: np.ndarray | None = None
 
     def _ensure(self, sample_tensor: Tensor) -> np.memmap:
         if self._mm is not None:
@@ -100,7 +122,23 @@ class _Shard:
         self._staging = torch.zeros(shape, dtype=tensor.dtype, pin_memory=True)
         return self._staging
 
-    def write(self, sample_ids: Tensor, tensor: Tensor) -> None:
+    def write(
+        self,
+        sample_ids: Tensor,
+        tensor: Tensor,
+        sample_lengths: Tensor | None = None,
+    ) -> None:
+        if sample_lengths is not None:
+            self._enter_ragged()
+            self._write_ragged(sample_ids, tensor, sample_lengths)
+            return
+        if self._layout == "ragged":
+            raise RuntimeError(
+                f"shard {self.path.name!r} was written ragged; cannot mix in "
+                "dense writes (omit sample_lengths once a shard is ragged)"
+            )
+        self._layout = "dense"
+
         mm = self._ensure(tensor)
         ids_np = sample_ids.detach().to(device="cpu", dtype=torch.int64).numpy()
 
@@ -135,6 +173,101 @@ class _Shard:
 
         self._dirty = True
 
+    def _enter_ragged(self) -> None:
+        if self._layout == "dense":
+            raise RuntimeError(
+                f"shard {self.path.name!r} was written dense; cannot mix in "
+                "ragged writes (must supply sample_lengths from the first write)"
+            )
+        if self._layout is None:
+            self._layout = "ragged"
+            self._sample_raw_offsets = np.full(self.n_samples, -1, dtype=np.int64)
+            self._sample_lengths_arr = np.zeros(self.n_samples, dtype=np.int64)
+            self._sample_written = np.zeros(self.n_samples, dtype=bool)
+
+    def _ensure_raw(self, tensor: Tensor, n_rows: int) -> np.memmap:
+        """Reserve raw-file capacity for `n_rows` more rows.
+
+        Raw file holds chunks in arrival order (out-of-order by sample_id);
+        reordering happens at drain/read.
+        """
+        if self.per_row_shape is None:
+            self.torch_dtype = tensor.dtype
+            self.per_row_shape = tuple(tensor.shape[1:])
+            np_dtype = _TORCH_TO_NUMPY.get(tensor.dtype)
+            if np_dtype is None:
+                self._stores_bf16_as_u16 = True
+                np_dtype = np.uint16
+            self._np_dtype = np_dtype
+
+        needed = self._raw_cursor + n_rows
+        if self._raw_mm is not None and needed <= self._raw_capacity_rows:
+            return self._raw_mm
+
+        grow = self._raw_capacity_rows * 2 if self._raw_capacity_rows else n_rows * 4
+        new_capacity = max(needed, grow)
+        if self._raw_mm is not None:
+            self._raw_mm.flush()
+            del self._raw_mm
+            self._raw_mm = None
+        shape = (new_capacity, *self.per_row_shape)
+        if self._raw_path.exists():
+            self._raw_mm = np.memmap(
+                self._raw_path, dtype=self._np_dtype, mode="r+", shape=shape
+            )
+        else:
+            self._raw_mm = np.memmap(
+                self._raw_path, dtype=self._np_dtype, mode="w+", shape=shape
+            )
+        self._raw_capacity_rows = new_capacity
+        return self._raw_mm
+
+    def _write_ragged(
+        self, sample_ids: Tensor, tensor: Tensor, sample_lengths: Tensor
+    ) -> None:
+        ids_np = sample_ids.detach().to(device="cpu", dtype=torch.int64).numpy()
+        lengths_np = sample_lengths.detach().to(device="cpu", dtype=torch.int64).numpy()
+        if int(lengths_np.sum()) != int(tensor.shape[0]):
+            raise ValueError(
+                f"sum(sample_lengths)={int(lengths_np.sum())} but tensor has "
+                f"{int(tensor.shape[0])} rows"
+            )
+        if ids_np.shape[0] != lengths_np.shape[0]:
+            raise ValueError(
+                f"sample_ids ({ids_np.shape[0]}) and sample_lengths "
+                f"({lengths_np.shape[0]}) differ"
+            )
+
+        host = tensor.detach().to(device="cpu")
+        if self._stores_bf16_as_u16 or host.dtype == torch.bfloat16:
+            self._stores_bf16_as_u16 = True
+            host = host.view(torch.uint16)
+
+        n_rows = int(host.shape[0])
+        raw_mm = self._ensure_raw(tensor, n_rows)
+        write_start = self._raw_cursor
+        raw_mm[write_start : write_start + n_rows] = host.numpy()
+        self._raw_cursor += n_rows
+
+        cursor = write_start
+        assert self._sample_raw_offsets is not None
+        assert self._sample_lengths_arr is not None
+        assert self._sample_written is not None
+        for i in range(ids_np.shape[0]):
+            sid = int(ids_np[i])
+            length = int(lengths_np[i])
+            if self._sample_written[sid]:
+                raise RuntimeError(
+                    f"sample {sid} written twice to ragged shard {self.path.name!r}"
+                )
+            self._sample_raw_offsets[sid] = cursor
+            self._sample_lengths_arr[sid] = length
+            self._sample_written[sid] = True
+            cursor += length
+
+        self._dirty = True
+        self._final_built = False
+
     def _drain_staging(self) -> None:
         if not self._pending:
             return
@@ -157,9 +290,85 @@ class _Shard:
         """
         if not self._dirty:
             return
+        if self._layout == "ragged":
+            if self._raw_mm is not None:
+                self._raw_mm.flush()
+            # Materialize the final sample-id-ordered file + sidecar so the
+            # shard is self-describing on disk after every drain.
+            self._build_final_ragged()
+            if _HAS_POSIX_FADVISE:
+                for p in (self._raw_path, self.path):
+                    try:
+                        fd = os.open(str(p), os.O_RDONLY)
+                        try:
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        finally:
+                            os.close(fd)
+                    except OSError:
+                        pass
+            self._dirty = False
+            return
         self._drain_staging()
         self._flush_and_evict()
         self._dirty = False
+
+    def _build_final_ragged(self) -> None:
+        """Reorder raw arrival-order data into sample-id order on the final .bin.
+
+        Called lazily on read(). Writes the per-sample sidecar with the final
+        offsets so the file is self-describing.
+        """
+        if self._final_built:
+            return
+        if (
+            self._raw_mm is None
+            or self._sample_lengths_arr is None
+            or self._sample_raw_offsets is None
+            or self._sample_written is None
+            or self.per_row_shape is None
+        ):
+            raise RuntimeError(
+                f"shard {self.path.name!r} has no ragged data to materialize"
+            )
+
+        self._raw_mm.flush()
+
+        lengths = self._sample_lengths_arr
+        offsets = np.zeros(self.n_samples + 1, dtype=np.int64)
+        np.cumsum(lengths, out=offsets[1:])
+        total = int(offsets[-1])
+
+        shape = (total, *self.per_row_shape)
+        final_mm = np.memmap(self.path, dtype=self._np_dtype, mode="w+", shape=shape)
+        for sid in range(self.n_samples):
+            length = int(lengths[sid])
+            if length == 0:
+                continue
+            raw_off = int(self._sample_raw_offsets[sid])
+            final_mm[int(offsets[sid]) : int(offsets[sid]) + length] = (
+                self._raw_mm[raw_off : raw_off + length]
+            )
+        final_mm.flush()
+        self._mm = final_mm
+
+        torch_dtype_label = "bfloat16" if self._stores_bf16_as_u16 else (
+            str(self.torch_dtype).removeprefix("torch.") if self.torch_dtype else "unknown"
+        )
+        meta_path = self.path.with_suffix(".json")
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "layout": "ragged",
+                    "n_samples": self.n_samples,
+                    "per_row_shape": list(self.per_row_shape),
+                    "dtype": torch_dtype_label,
+                    "bf16_as_u16": self._stores_bf16_as_u16,
+                    "offsets": offsets.tolist(),
+                }
+            )
+        )
+        self._final_offsets = offsets
+        self._final_built = True
 
     def _flush_and_evict(self) -> None:
         """Flush dirty pages to disk, then advise the kernel to reclaim them.
@@ -181,7 +390,19 @@ class _Shard:
             except OSError:
                 pass
 
-    def read(self) -> Tensor:
+    def read(self) -> Tensor | RaggedTensor:
+        if self._layout == "ragged":
+            self._build_final_ragged()
+            assert self._mm is not None
+            assert self._final_offsets is not None
+            self._mm.flush()
+            arr = np.asarray(self._mm)
+            flat = torch.from_numpy(arr)
+            if self._stores_bf16_as_u16:
+                flat = flat.view(torch.bfloat16)
+            offsets = torch.from_numpy(self._final_offsets.copy())
+            return RaggedTensor(flat=flat, offsets=offsets)
+
         if self._mm is None:
             raise RuntimeError(f"shard {self.path.name!r} was never written to")
         # _dirty intentionally not cleared: drain() still needs fadvise for eviction.
@@ -244,10 +465,11 @@ class MemmapBackend:
         hook: HookName,
         sample_ids: Tensor,
         tensor: Tensor,
+        sample_lengths: Tensor | None = None,
     ) -> None:
-        self._shard(layer_idx, hook).write(sample_ids, tensor)
+        self._shard(layer_idx, hook).write(sample_ids, tensor, sample_lengths)
 
-    def read_all(self, layer_idx: int, hook: HookName) -> Tensor:
+    def read_all(self, layer_idx: int, hook: HookName) -> Tensor | RaggedTensor:
         key = (layer_idx, hook)
         if key not in self._shards:
             raise KeyError(

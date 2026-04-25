@@ -30,6 +30,7 @@ from fpwap.types import (
     HookName,
     LoadingStrategy,
     PaddingMode,
+    RaggedTensor,
     WriteBack,
 )
 
@@ -282,20 +283,24 @@ class Result:
     # When no StorageBackend is set, Emit outputs are collected in memory per
     # (layer, hook). Fine for moderate-size sweeps; for dataset-scale
     # extraction, swap in a storage backend to avoid RAM pressure.
-    _emits: dict[tuple[int, str], list[tuple[Tensor, Tensor]]] = field(
-        default_factory=dict
-    )
+    # Each entry is (sample_ids, tensor, sample_lengths_or_None). When the
+    # last element is non-None, the microbatch was a ragged emit (#65).
+    _emits: dict[
+        tuple[int, str], list[tuple[Tensor, Tensor, Tensor | None]]
+    ] = field(default_factory=dict)
 
     def artifact(self, kind: str, layer: int) -> Artifact:
         return self.artifacts[(kind, layer)]
 
-    def activations(self, layer: int, hook: HookName) -> Tensor:
+    def activations(self, layer: int, hook: HookName) -> Tensor | RaggedTensor:
         """Concatenate emitted activations for (layer, hook) in sample-id order.
 
         Requires at least one read-phase callback (e.g. RawActivations) to have
         emitted for this (layer, hook). With a StorageBackend wired, reads the
         full corpus back from disk (the backend owns shape/dtype); otherwise
-        concatenates the in-memory microbatch emits.
+        concatenates the in-memory microbatch emits. Returns a `RaggedTensor`
+        when the underlying emits were ragged (callback supplied
+        `Emit.sample_lengths`).
         """
         if self.storage is not None:
             return self.storage.read_all(layer, hook)
@@ -306,8 +311,49 @@ class Result:
                 f"add a read-phase callback that returns Emit (e.g. RawActivations)"
             )
         parts = self._emits[key]
+        ragged = any(p[2] is not None for p in parts)
+        if ragged:
+            if not all(p[2] is not None for p in parts):
+                raise RuntimeError(
+                    f"layer={layer} hook={hook!r}: mixed dense + ragged emits"
+                )
+            # Sort by first sample_id within each microbatch — within a single
+            # microbatch the per-sample order is preserved as supplied.
+            ordered = sorted(parts, key=lambda p: int(p[0][0]))
+            ids_concat = torch.cat([p[0] for p in ordered], dim=0)
+            lengths_concat = torch.cat(
+                [p[2] for p in ordered if p[2] is not None], dim=0
+            )
+            flat_concat = torch.cat([p[1] for p in ordered], dim=0)
+            # Reorder samples to true sample-id order across microbatches.
+            order = torch.argsort(ids_concat, stable=True)
+            sorted_lengths = lengths_concat[order]
+            offsets = torch.zeros(
+                int(order.shape[0]) + 1, dtype=torch.int64
+            )
+            offsets[1:] = torch.cumsum(sorted_lengths, dim=0)
+            # Build the input-side per-sample slices, then place them in
+            # output-order positions.
+            in_offsets = torch.zeros(
+                int(ids_concat.shape[0]) + 1, dtype=torch.int64
+            )
+            in_offsets[1:] = torch.cumsum(lengths_concat, dim=0)
+            total = int(offsets[-1].item())
+            out_flat = torch.empty(
+                (total, *flat_concat.shape[1:]), dtype=flat_concat.dtype
+            )
+            for out_pos, in_pos in enumerate(order.tolist()):
+                length = int(lengths_concat[in_pos].item())
+                if length == 0:
+                    continue
+                src_start = int(in_offsets[in_pos].item())
+                dst_start = int(offsets[out_pos].item())
+                out_flat[dst_start : dst_start + length] = (
+                    flat_concat[src_start : src_start + length]
+                )
+            return RaggedTensor(flat=out_flat, offsets=offsets)
         ordered = sorted(parts, key=lambda p: int(p[0][0]))
-        tensors = [t for _, t in ordered]
+        tensors = [t for _, t, _ in ordered]
         if tensors and tensors[0].dim() >= 2:
             seq_dims = {t.shape[1] for t in tensors}
             if len(seq_dims) > 1:
@@ -1183,7 +1229,9 @@ class Sweep:
             )]
         pl.build_segments_s = (time.perf_counter_ns() - t0) / 1e9
 
-        emits_sink: dict[tuple[int, str], list[tuple[Tensor, Tensor]]] = {}
+        emits_sink: dict[
+            tuple[int, str], list[tuple[Tensor, Tensor, Tensor | None]]
+        ] = {}
         layer_artifacts: dict[tuple[str, int], Artifact] = {}
 
         _emit_progress("preloop_storage_start", -1, 0, 0)
@@ -1606,7 +1654,9 @@ class Sweep:
         hook: HookName,
         acts: Tensor,
         sample_ids: Tensor,
-        emits_sink: dict[tuple[int, str], list[tuple[Tensor, Tensor]]] | None = None,
+        emits_sink: dict[
+            tuple[int, str], list[tuple[Tensor, Tensor, Tensor | None]]
+        ] | None = None,
         write_allowed: bool = True,
     ) -> tuple[Tensor, float]:
         """Phase-ordered dispatch: read → write (sequential) → read_after_write.
@@ -1625,9 +1675,10 @@ class Sweep:
                     f"read-phase callback {type(cb).__name__} returned WriteBack"
                 )
             if isinstance(result, Emit):
+                ragged_lengths = result.sample_lengths
                 if self.storage is not None:
                     emit_tensor = result.tensor
-                    if (
+                    if ragged_lengths is None and (
                         emit_tensor.dim() >= 2
                         and emit_tensor.shape[1] < self.seq_len
                     ):
@@ -1639,7 +1690,8 @@ class Sweep:
                         emit_tensor = torch.cat([z, emit_tensor], dim=1)
                     t0_emit = time.perf_counter_ns()
                     self.storage.write_emit(
-                        layer_idx, hook, sample_ids, emit_tensor
+                        layer_idx, hook, sample_ids, emit_tensor,
+                        sample_lengths=ragged_lengths,
                     )
                     emit_s += (time.perf_counter_ns() - t0_emit) / 1e9
                 elif emits_sink is not None:
@@ -1648,6 +1700,11 @@ class Sweep:
                         (
                             sample_ids.detach().to("cpu", copy=True),
                             result.tensor.detach().to("cpu", copy=True),
+                            (
+                                ragged_lengths.detach().to("cpu", copy=True)
+                                if ragged_lengths is not None
+                                else None
+                            ),
                         )
                     )
 
