@@ -4,7 +4,7 @@ from typing import Protocol
 
 from torch import Tensor
 
-from fpwap.types import HookName
+from fpwap.types import HookName, RaggedTensor
 
 
 class StorageBackend(Protocol):
@@ -15,6 +15,11 @@ class StorageBackend(Protocol):
     `result.activations(layer, hook)`. on_sweep_end gives the backend a
     chance to flush. Backends MAY lazily size their storage on first
     write_emit (shape comes from the tensor itself).
+
+    Ragged emits (#65): when a callback returns Emit with sample_lengths set,
+    the engine forwards them via the optional sample_lengths kwarg. The
+    backend stores rows as a flat `[sum(lengths), *trailing]` tensor; read_all
+    returns a RaggedTensor (flat + per-sample offsets) for that shard.
     """
 
     def on_sweep_start(self, sweep_id: str, n_samples: int) -> None: ...
@@ -25,9 +30,20 @@ class StorageBackend(Protocol):
         hook: HookName,
         sample_ids: Tensor,
         tensor: Tensor,
+        sample_lengths: Tensor | None = None,
     ) -> None: ...
 
-    def read_all(self, layer_idx: int, hook: HookName) -> Tensor: ...
+    def read_all(
+        self, layer_idx: int, hook: HookName
+    ) -> Tensor | RaggedTensor:
+        """Read the full corpus for one (layer, hook).
+
+        Returns a `Tensor` for dense shards (written without
+        `sample_lengths`) and a `RaggedTensor` for ragged shards. Callers
+        iterating over multiple (layer, hook) pairs that may mix layouts
+        must dispatch on `isinstance(result, RaggedTensor)`.
+        """
+        ...
 
     def drain_emits(self) -> None: ...
 

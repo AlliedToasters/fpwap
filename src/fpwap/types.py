@@ -16,6 +16,7 @@ Phase = Literal["read", "write", "read_after_write"]
 class Emit:
     tensor: Tensor
     dtype: torch.dtype | None = None
+    sample_lengths: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,32 @@ class WriteBack:
 
 
 BatchResult: TypeAlias = Emit | WriteBack | None
+
+
+@dataclass(frozen=True)
+class RaggedTensor:
+    """Variable-length per-sample tensor, stored as a flat tensor + offsets.
+
+    `flat` is `[total_tokens, *trailing_shape]`. `offsets` is `[N_samples + 1]`
+    int64; sample i lives at `flat[offsets[i]:offsets[i+1]]`. Returned by
+    `Result.activations(...)` and `MemmapBackend.read_all(...)` when the
+    underlying emit was ragged (callback supplied `Emit.sample_lengths`).
+    """
+
+    flat: Tensor
+    offsets: Tensor
+
+    def __len__(self) -> int:
+        return int(self.offsets.shape[0]) - 1
+
+    def __getitem__(self, i: int) -> Tensor:
+        start = int(self.offsets[i].item())
+        stop = int(self.offsets[i + 1].item())
+        return self.flat[start:stop]
+
+    @property
+    def lengths(self) -> Tensor:
+        return self.offsets[1:] - self.offsets[:-1]
 
 
 @dataclass(frozen=True)
