@@ -45,7 +45,9 @@ def _shard_basename(layer_idx: int, hook: HookName) -> str:
 class _Shard:
     """One memmap file + its per-row shape/dtype, lazily sized."""
 
-    def __init__(self, path: Path, n_samples: int) -> None:
+    def __init__(
+        self, path: Path, n_samples: int, max_staging_bytes: int = 0
+    ) -> None:
         self.path = path
         self.n_samples = n_samples
         self._mm: np.memmap | None = None
@@ -54,6 +56,12 @@ class _Shard:
         self._np_dtype: Any = None
         self._stores_bf16_as_u16: bool = False
         self._dirty: bool = False
+
+        self._max_staging_bytes = max_staging_bytes
+        self._staging: Tensor | None = None
+        self._max_staging_rows: int = 0
+        self._staging_cursor: int = 0
+        self._pending: list[tuple[np.ndarray, int, int]] = []
 
     def _ensure(self, sample_tensor: Tensor) -> np.memmap:
         if self._mm is not None:
@@ -83,14 +91,64 @@ class _Shard:
         )
         return self._mm
 
+    def _ensure_staging(self, tensor: Tensor) -> Tensor:
+        if self._staging is not None:
+            return self._staging
+        per_row_bytes = tensor[0:1].nelement() * tensor.element_size()
+        self._max_staging_rows = max(1, self._max_staging_bytes // per_row_bytes)
+        shape = (self._max_staging_rows, *tensor.shape[1:])
+        self._staging = torch.zeros(shape, dtype=tensor.dtype, pin_memory=True)
+        return self._staging
+
     def write(self, sample_ids: Tensor, tensor: Tensor) -> None:
         mm = self._ensure(tensor)
         ids_np = sample_ids.detach().to(device="cpu", dtype=torch.int64).numpy()
-        host = tensor.detach().to(device="cpu")
-        if self._stores_bf16_as_u16:
-            host = host.view(torch.uint16)
-        mm[ids_np] = host.numpy()
+
+        if (
+            tensor.device.type == "cuda"
+            and self._max_staging_bytes > 0
+        ):
+            n_rows = tensor.shape[0]
+            staging = self._ensure_staging(tensor)
+
+            if n_rows > self._max_staging_rows:
+                host = tensor.detach().to(device="cpu")
+                if self._stores_bf16_as_u16:
+                    host = host.view(torch.uint16)
+                mm[ids_np] = host.numpy()
+                self._dirty = True
+                return
+
+            if self._staging_cursor + n_rows > self._max_staging_rows:
+                self._drain_staging()
+
+            start = self._staging_cursor
+            stop = start + n_rows
+            staging[start:stop].copy_(tensor, non_blocking=True)
+            self._pending.append((ids_np, start, stop))
+            self._staging_cursor = stop
+        else:
+            host = tensor.detach().to(device="cpu")
+            if self._stores_bf16_as_u16:
+                host = host.view(torch.uint16)
+            mm[ids_np] = host.numpy()
+
         self._dirty = True
+
+    def _drain_staging(self) -> None:
+        if not self._pending:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        assert self._staging is not None
+        assert self._mm is not None
+        for ids_np, start, stop in self._pending:
+            host = self._staging[start:stop]
+            if self._stores_bf16_as_u16:
+                host = host.view(torch.uint16)
+            self._mm[ids_np] = host.numpy()
+        self._pending.clear()
+        self._staging_cursor = 0
 
     def drain(self) -> None:
         """Flush dirty pages to disk and evict from page cache.
@@ -99,6 +157,7 @@ class _Shard:
         """
         if not self._dirty:
             return
+        self._drain_staging()
         self._flush_and_evict()
         self._dirty = False
 
@@ -145,11 +204,16 @@ class MemmapBackend:
     describing shape and dtype.
     """
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        max_staging_bytes: int = 2 * 1024**3,
+    ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._n_samples: int | None = None
         self._shards: dict[tuple[int, str], _Shard] = {}
+        self._max_staging_bytes = max_staging_bytes
 
     def on_sweep_start(self, sweep_id: str, n_samples: int) -> None:
         self._n_samples = n_samples
@@ -162,7 +226,9 @@ class MemmapBackend:
         key = (layer_idx, hook)
         if key not in self._shards:
             path = self.root / f"{_shard_basename(layer_idx, hook)}.bin"
-            self._shards[key] = _Shard(path, self._n_samples)
+            self._shards[key] = _Shard(
+                path, self._n_samples, self._max_staging_bytes
+            )
         return self._shards[key]
 
     def write_emit(
