@@ -35,7 +35,15 @@ class StorageBackend(Protocol):
 
     def read_all(
         self, layer_idx: int, hook: HookName
-    ) -> Tensor | RaggedTensor: ...
+    ) -> Tensor | RaggedTensor:
+        """Read the full corpus for one (layer, hook).
+
+        Returns a `Tensor` for dense shards (written without
+        `sample_lengths`) and a `RaggedTensor` for ragged shards. Callers
+        iterating over multiple (layer, hook) pairs that may mix layouts
+        must dispatch on `isinstance(result, RaggedTensor)`.
+        """
+        ...
 
     def drain_emits(self) -> None: ...
 

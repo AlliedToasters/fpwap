@@ -298,9 +298,12 @@ class Result:
         Requires at least one read-phase callback (e.g. RawActivations) to have
         emitted for this (layer, hook). With a StorageBackend wired, reads the
         full corpus back from disk (the backend owns shape/dtype); otherwise
-        concatenates the in-memory microbatch emits. Returns a `RaggedTensor`
-        when the underlying emits were ragged (callback supplied
-        `Emit.sample_lengths`).
+        concatenates the in-memory microbatch emits.
+
+        Return type is a union: a dense `Tensor` for ordinary emits, or a
+        `RaggedTensor(flat, offsets)` when the callback supplied
+        `Emit.sample_lengths`. Callers that may receive either layout must
+        dispatch on `isinstance(result, RaggedTensor)`.
         """
         if self.storage is not None:
             return self.storage.read_all(layer, hook)
@@ -317,40 +320,44 @@ class Result:
                 raise RuntimeError(
                     f"layer={layer} hook={hook!r}: mixed dense + ragged emits"
                 )
-            # Sort by first sample_id within each microbatch — within a single
-            # microbatch the per-sample order is preserved as supplied.
-            ordered = sorted(parts, key=lambda p: int(p[0][0]))
-            ids_concat = torch.cat([p[0] for p in ordered], dim=0)
+            # Concatenate microbatches in arrival order.
+            ids_concat = torch.cat([p[0] for p in parts], dim=0)
             lengths_concat = torch.cat(
-                [p[2] for p in ordered if p[2] is not None], dim=0
-            )
-            flat_concat = torch.cat([p[1] for p in ordered], dim=0)
+                [p[2] for p in parts if p[2] is not None], dim=0
+            ).to(torch.int64)
+            flat_concat = torch.cat([p[1] for p in parts], dim=0)
+            n = int(ids_concat.shape[0])
+            total = int(lengths_concat.sum().item())
+
             # Reorder samples to true sample-id order across microbatches.
             order = torch.argsort(ids_concat, stable=True)
+            inv_order = torch.empty_like(order)
+            inv_order[order] = torch.arange(n, dtype=order.dtype)
+
             sorted_lengths = lengths_concat[order]
-            offsets = torch.zeros(
-                int(order.shape[0]) + 1, dtype=torch.int64
-            )
+            offsets = torch.zeros(n + 1, dtype=torch.int64)
             offsets[1:] = torch.cumsum(sorted_lengths, dim=0)
-            # Build the input-side per-sample slices, then place them in
-            # output-order positions.
-            in_offsets = torch.zeros(
-                int(ids_concat.shape[0]) + 1, dtype=torch.int64
-            )
+
+            in_offsets = torch.zeros(n + 1, dtype=torch.int64)
             in_offsets[1:] = torch.cumsum(lengths_concat, dim=0)
-            total = int(offsets[-1].item())
+
+            # Vectorized scatter: build dst_for_row[total] in one pass.
+            # sample_of_row[r] = which input-order sample owns input row r.
+            sample_of_row = torch.repeat_interleave(
+                torch.arange(n, dtype=torch.int64), lengths_concat
+            )
+            dst_starts_per_sample = offsets[inv_order]  # [n]
+            src_starts_per_sample = in_offsets[:n]  # [n]
+            row_idx = torch.arange(total, dtype=torch.int64)
+            dst_for_row = (
+                dst_starts_per_sample[sample_of_row]
+                + (row_idx - src_starts_per_sample[sample_of_row])
+            )
+
             out_flat = torch.empty(
                 (total, *flat_concat.shape[1:]), dtype=flat_concat.dtype
             )
-            for out_pos, in_pos in enumerate(order.tolist()):
-                length = int(lengths_concat[in_pos].item())
-                if length == 0:
-                    continue
-                src_start = int(in_offsets[in_pos].item())
-                dst_start = int(offsets[out_pos].item())
-                out_flat[dst_start : dst_start + length] = (
-                    flat_concat[src_start : src_start + length]
-                )
+            out_flat[dst_for_row] = flat_concat
             return RaggedTensor(flat=out_flat, offsets=offsets)
         ordered = sorted(parts, key=lambda p: int(p[0][0]))
         tensors = [t for _, t, _ in ordered]

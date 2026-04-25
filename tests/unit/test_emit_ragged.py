@@ -174,6 +174,58 @@ class TestMemmapBackendRagged:
         assert isinstance(out, torch.Tensor)
         assert torch.equal(out, t)
 
+    def test_ragged_raw_scratch_dropped_after_sweep_end(self, tmp_path: Path) -> None:
+        """After on_sweep_end the .raw.bin scratch must not survive on disk."""
+        backend = MemmapBackend(root=tmp_path)
+        backend.on_sweep_start("test", n_samples=2)
+        backend.write_emit(
+            0,
+            "residual_post",
+            torch.tensor([0, 1]),
+            torch.zeros(3, 4),
+            sample_lengths=torch.tensor([1, 2], dtype=torch.int64),
+        )
+        # Mid-sweep drain: raw scratch may still be present.
+        backend.drain_emits()
+        backend.on_sweep_end()
+
+        raw_files = list(tmp_path.glob("*.raw.bin"))
+        assert raw_files == [], f"orphaned raw scratch: {raw_files}"
+        # Final .bin and sidecar must exist.
+        assert list(tmp_path.glob("*.bin")) != []
+        assert list(tmp_path.glob("*.json")) != []
+
+    def test_ragged_drain_does_not_rebuild_final(self, tmp_path: Path) -> None:
+        """drain() for ragged shards must NOT call _build_final_ragged.
+
+        Rebuilding on every chunk-boundary drain is O(N_microbatches × bytes)
+        wasted I/O on multi-layer-capture sweeps. Final rebuild is deferred
+        to read() / finalize().
+        """
+        from unittest.mock import patch
+
+        backend = MemmapBackend(root=tmp_path)
+        backend.on_sweep_start("test", n_samples=2)
+        backend.write_emit(
+            0,
+            "residual_post",
+            torch.tensor([0, 1]),
+            torch.zeros(3, 4),
+            sample_lengths=torch.tensor([1, 2], dtype=torch.int64),
+        )
+
+        shard = backend._shards[(0, "residual_post")]
+        with patch.object(shard, "_build_final_ragged") as mock_build:
+            backend.drain_emits()
+            mock_build.assert_not_called()
+
+        # finalize at sweep_end must build exactly once.
+        with patch.object(
+            shard, "_build_final_ragged", wraps=shard._build_final_ragged
+        ) as mock_build:
+            backend.on_sweep_end()
+            mock_build.assert_called_once()
+
     def test_ragged_sidecar_records_layout(self, tmp_path: Path) -> None:
         """Sidecar JSON must record ragged layout so the file is self-describing."""
         import json

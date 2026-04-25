@@ -291,15 +291,16 @@ class _Shard:
         if not self._dirty:
             return
         if self._layout == "ragged":
+            # Drain only flushes the arrival-order .raw.bin and advises the
+            # kernel to reclaim its pages. The sample-id-ordered final .bin
+            # is built lazily on read() / finalize() — rebuilding on every
+            # chunk-boundary drain is O(N_microbatches × total_bytes) wasted
+            # I/O on multi-layer-capture sweeps.
             if self._raw_mm is not None:
                 self._raw_mm.flush()
-            # Materialize the final sample-id-ordered file + sidecar so the
-            # shard is self-describing on disk after every drain.
-            self._build_final_ragged()
-            if _HAS_POSIX_FADVISE:
-                for p in (self._raw_path, self.path):
+                if _HAS_POSIX_FADVISE:
                     try:
-                        fd = os.open(str(p), os.O_RDONLY)
+                        fd = os.open(str(self._raw_path), os.O_RDONLY)
                         try:
                             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
                         finally:
@@ -315,8 +316,8 @@ class _Shard:
     def _build_final_ragged(self) -> None:
         """Reorder raw arrival-order data into sample-id order on the final .bin.
 
-        Called lazily on read(). Writes the per-sample sidecar with the final
-        offsets so the file is self-describing.
+        Called lazily on read() / finalize(). Writes the per-sample sidecar
+        with the final offsets so the file is self-describing.
         """
         if self._final_built:
             return
@@ -339,7 +340,24 @@ class _Shard:
         total = int(offsets[-1])
 
         shape = (total, *self.per_row_shape)
-        final_mm = np.memmap(self.path, dtype=self._np_dtype, mode="w+", shape=shape)
+        # Reuse the existing final file if it's already the right size; only
+        # truncate (mode="w+") on first build or when total grew.
+        if (
+            self._mm is not None
+            and self.path.exists()
+            and self._mm.shape == shape
+        ):
+            final_mm = np.memmap(
+                self.path, dtype=self._np_dtype, mode="r+", shape=shape
+            )
+        else:
+            if self._mm is not None:
+                self._mm.flush()
+                del self._mm
+                self._mm = None
+            final_mm = np.memmap(
+                self.path, dtype=self._np_dtype, mode="w+", shape=shape
+            )
         for sid in range(self.n_samples):
             length = int(lengths[sid])
             if length == 0:
@@ -369,6 +387,28 @@ class _Shard:
         )
         self._final_offsets = offsets
         self._final_built = True
+
+    def finalize(self) -> None:
+        """Build the final sample-id-ordered .bin and drop the raw scratch file.
+
+        Called once at sweep end (no further writes expected). Any subsequent
+        write would error since the raw scratch is gone — by design.
+        """
+        if self._layout != "ragged":
+            return
+        if self._raw_mm is None:
+            return
+        self._build_final_ragged()
+        # Drop the raw scratch file: ~doubles disk usage if left around
+        # (raw + final coexist for the rest of the sweep).
+        self._raw_mm.flush()
+        del self._raw_mm
+        self._raw_mm = None
+        self._raw_capacity_rows = 0
+        try:
+            self._raw_path.unlink()
+        except OSError:
+            pass
 
     def _flush_and_evict(self) -> None:
         """Flush dirty pages to disk, then advise the kernel to reclaim them.
@@ -470,6 +510,22 @@ class MemmapBackend:
         self._shard(layer_idx, hook).write(sample_ids, tensor, sample_lengths)
 
     def read_all(self, layer_idx: int, hook: HookName) -> Tensor | RaggedTensor:
+        """Read the full corpus for one (layer, hook).
+
+        Returns:
+            * `Tensor` of shape `[N_samples, *per_row_shape]` for shards
+              written via dense `Emit(tensor=...)`. The tensor is backed by
+              the on-disk memmap, so the OS page cache is the budget — the
+              full corpus does not need to fit in RAM.
+            * `RaggedTensor(flat, offsets)` for shards written with
+              `Emit(tensor=..., sample_lengths=...)`. `flat[offsets[i]:
+              offsets[i+1]]` is sample `i`'s contribution. `flat` is also
+              memmap-backed.
+
+        The return type is a union — callers iterating over multiple
+        (layer, hook) pairs that may mix layouts must dispatch on
+        `isinstance(result, RaggedTensor)`.
+        """
         key = (layer_idx, hook)
         if key not in self._shards:
             raise KeyError(
@@ -483,3 +539,7 @@ class MemmapBackend:
 
     def on_sweep_end(self) -> None:
         self.drain_emits()
+        # No more writes after sweep end: build the sample-id-ordered final
+        # file for each ragged shard and drop its .raw.bin scratch.
+        for shard in self._shards.values():
+            shard.finalize()
