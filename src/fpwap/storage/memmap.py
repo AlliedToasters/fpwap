@@ -209,6 +209,13 @@ class MemmapBackend:
         root: Path | str,
         max_staging_bytes: int = 2 * 1024**3,
     ) -> None:
+        """
+        Args:
+            root: Directory for memmap shard files.
+            max_staging_bytes: Per-shard pinned-host staging budget for async
+                GPU→CPU copies. Total pinned memory = n_captured_shards × this
+                value. Set to 0 to disable staging (synchronous writes).
+        """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._n_samples: int | None = None
