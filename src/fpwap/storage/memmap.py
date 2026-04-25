@@ -84,6 +84,7 @@ class _Shard:
         self._sample_written: np.ndarray | None = None  # bool[n_samples]
         self._final_built: bool = False
         self._final_offsets: np.ndarray | None = None
+        self._finalized: bool = False
 
     def _ensure(self, sample_tensor: Tensor) -> np.memmap:
         if self._mm is not None:
@@ -128,6 +129,12 @@ class _Shard:
         tensor: Tensor,
         sample_lengths: Tensor | None = None,
     ) -> None:
+        if self._finalized:
+            raise RuntimeError(
+                f"shard {self.path.name!r} was finalized (sweep ended); "
+                "no further writes accepted. The .raw.bin scratch was "
+                "dropped — re-running the sweep is the only path forward."
+            )
         if sample_lengths is not None:
             self._enter_ragged()
             self._write_ragged(sample_ids, tensor, sample_lengths)
@@ -391,12 +398,13 @@ class _Shard:
     def finalize(self) -> None:
         """Build the final sample-id-ordered .bin and drop the raw scratch file.
 
-        Called once at sweep end (no further writes expected). Any subsequent
-        write would error since the raw scratch is gone — by design.
+        Called once at sweep end (no further writes expected). Subsequent
+        writes raise — by design, since the raw scratch is gone.
         """
         if self._layout != "ragged":
             return
         if self._raw_mm is None:
+            self._finalized = True
             return
         self._build_final_ragged()
         # Drop the raw scratch file: ~doubles disk usage if left around
@@ -409,6 +417,7 @@ class _Shard:
             self._raw_path.unlink()
         except OSError:
             pass
+        self._finalized = True
 
     def _flush_and_evict(self) -> None:
         """Flush dirty pages to disk, then advise the kernel to reclaim them.

@@ -195,6 +195,34 @@ class TestMemmapBackendRagged:
         assert list(tmp_path.glob("*.bin")) != []
         assert list(tmp_path.glob("*.json")) != []
 
+    def test_write_after_finalize_raises_clearly(self, tmp_path: Path) -> None:
+        """A write after sweep_end / finalize() must raise a clear error,
+        not corrupt mid-pipeline. Avoids confusing failures from the missing
+        raw scratch file."""
+        backend = MemmapBackend(root=tmp_path)
+        backend.on_sweep_start("test", n_samples=2)
+        backend.write_emit(
+            0,
+            "residual_post",
+            torch.tensor([0]),
+            torch.zeros(1, 4),
+            sample_lengths=torch.tensor([1], dtype=torch.int64),
+        )
+        backend.on_sweep_end()
+
+        try:
+            backend.write_emit(
+                0,
+                "residual_post",
+                torch.tensor([1]),
+                torch.zeros(2, 4),
+                sample_lengths=torch.tensor([2], dtype=torch.int64),
+            )
+        except RuntimeError as exc:
+            assert "finalized" in str(exc).lower()
+            return
+        raise AssertionError("expected RuntimeError on write after finalize()")
+
     def test_ragged_drain_does_not_rebuild_final(self, tmp_path: Path) -> None:
         """drain() for ragged shards must NOT call _build_final_ragged.
 
