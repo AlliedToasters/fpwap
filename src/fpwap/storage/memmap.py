@@ -12,8 +12,10 @@ on the SPEC §17 target workload (Llama-70B × 10k prompts × 128 tokens ≈
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from fpwap.types import HookName, RaggedTensor
+from fpwap.types import HookName, RaggedTensor, ResultArtifact
 
 _HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 
@@ -552,3 +554,83 @@ class MemmapBackend:
         # file for each ragged shard and drop its .raw.bin scratch.
         for shard in self._shards.values():
             shard.finalize()
+
+    def path_for(
+        self,
+        layer_idx: int,
+        hook: HookName,
+        dest: Path | None = None,
+    ) -> ResultArtifact:
+        """Return an on-disk handle for one (layer, hook) — issue #70.
+
+        Skips the materialize-into-host-RAM round-trip in `read_all`. Useful
+        when the caller already plans to mmap-read or move the file
+        (cumulative emits across sweeps that won't fit in RAM).
+        """
+        key = (layer_idx, hook)
+        if key not in self._shards:
+            raise KeyError(
+                f"no emits recorded for layer={layer_idx} hook={hook!r}"
+            )
+        shard = self._shards[key]
+
+        # Make the on-disk artifact readable: drain pending staged writes,
+        # and for ragged build the final sample-id-ordered .bin + offsets
+        # sidecar. Mid-sweep callers may hit this before on_sweep_end.
+        shard.drain()
+        if shard._layout == "ragged":
+            shard._build_final_ragged()
+        elif shard._mm is None:
+            raise RuntimeError(
+                f"shard {shard.path.name!r} was never written to"
+            )
+        else:
+            shard._mm.flush()
+
+        data_path: Path = shard.path
+        sidecar_path: Path | None = shard.path.with_suffix(".json")
+        layout: str = shard._layout or "dense"
+        assert shard.torch_dtype is not None
+        dtype = shard.torch_dtype
+        shape: tuple[int, ...] | None
+        if layout == "dense":
+            assert shard.per_row_shape is not None
+            shape = (shard.n_samples, *shard.per_row_shape)
+        else:
+            shape = None
+
+        if dest is not None:
+            dest = Path(dest)
+            dest.mkdir(parents=True, exist_ok=True)
+            data_path = _link_or_copy(shard.path, dest / shard.path.name)
+            src_sidecar = shard.path.with_suffix(".json")
+            sidecar_path = _link_or_copy(
+                src_sidecar, dest / src_sidecar.name
+            ) if src_sidecar.exists() else None
+
+        return ResultArtifact(
+            data_path=data_path,
+            sidecar_path=sidecar_path,
+            layout=layout,  # type: ignore[arg-type]
+            dtype=dtype,
+            shape=shape,
+        )
+
+
+def _link_or_copy(src: Path, dst: Path) -> Path:
+    """Hardlink src → dst; fall back to copy on EXDEV (cross-filesystem).
+
+    Hardlink is the cheap path: backend keeps writing into its file, the
+    user holds a separate path with the same inode. If the destination
+    is on another filesystem the kernel rejects the link with EXDEV; copy
+    is the only option there.
+    """
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        shutil.copy2(src, dst)
+    return dst

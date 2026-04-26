@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 
 from torch import Tensor
 
-from fpwap.types import HookName, RaggedTensor
+from fpwap.types import HookName, RaggedTensor, ResultArtifact
 
 
 class StorageBackend(Protocol):
@@ -48,6 +49,30 @@ class StorageBackend(Protocol):
     def drain_emits(self) -> None: ...
 
     def on_sweep_end(self) -> None: ...
+
+    def path_for(
+        self,
+        layer_idx: int,
+        hook: HookName,
+        dest: Path | None = None,
+    ) -> ResultArtifact:
+        """Return an on-disk handle for one (layer, hook), bypassing the
+        materialize-into-RAM round-trip in `read_all` (issue #70).
+
+        Modes:
+            * `dest=None` — return a handle pointing at the backend's own
+              file. Caller mmap-reads on demand. Backend retains ownership;
+              the file lifetime is tied to the backend (e.g. a sweep
+              cleanup may delete it later).
+            * `dest=Path(dir)` — hardlink (fallback to copy on EXDEV) the
+              data file and its sidecar into `dir`, and return a handle
+              pointing at the hardlinked copy. Backend keeps the original.
+              Caller owns `dir` and decides when to delete.
+
+        Backends MUST flush pending writes (e.g. drain staging buffers,
+        finalize ragged shards) before returning so the file is readable.
+        """
+        ...
 
 
 __all__ = ["StorageBackend"]
