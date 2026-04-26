@@ -38,16 +38,15 @@ class ResidualBuffer:
     def __init__(
         self,
         n_samples: int,
+        *,
+        hidden: int,
         seq_len: int | None = None,
-        hidden: int = 0,  # required at call site; default keeps it after the optional seq_len
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cpu",
         path: Path | None = None,
         layout: BufferLayout = "dense",
         cu_seqlens: Tensor | None = None,
     ) -> None:
-        if hidden <= 0:
-            raise ValueError(f"hidden must be > 0; got {hidden}")
         if layout == "dense":
             if seq_len is None:
                 raise ValueError("dense layout requires seq_len")

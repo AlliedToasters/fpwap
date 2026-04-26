@@ -724,7 +724,14 @@ def _build_bucketed_segments(
         seg_path: Path | None = None
         if buffer_path is not None:
             seg_path = buffer_path.with_stem(f"{buffer_path.stem}_seq{bseq}")
-        buf = ResidualBuffer(n, bseq, hidden, transport_dtype, buf_device, path=seg_path)
+        buf = ResidualBuffer(
+            n_samples=n,
+            seq_len=bseq,
+            hidden=hidden,
+            dtype=transport_dtype,
+            device=buf_device,
+            path=seg_path,
+        )
         pin = buf_device.type == "cpu" and torch.cuda.is_available()
         mask_buf = torch.zeros(
             (n, bseq), dtype=torch.int64, device=buf_device, pin_memory=pin,
