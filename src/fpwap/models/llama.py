@@ -139,37 +139,50 @@ class LlamaPlumbing:
         model: nn.Module,
         block: nn.Module,
         hidden_states: Tensor,
-        cu_seqlens: Tensor,
-        position_ids: Tensor,
+        cu_seqlens: Tensor | None = None,
+        position_ids: Tensor | None = None,
+        block_mask: Any = None,
+        position_embeddings: tuple[Tensor, Tensor] | None = None,
         wanted_hooks: frozenset[str] = frozenset(),
         dispatch_fn: Any = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Packed forward: `hidden_states` is `[1, sum(L_i), H]`.
 
-        Boundaries between samples come from `cu_seqlens` (`[N+1]` int32);
-        `position_ids` is `[1, sum(L_i)]` with per-sample resets so RoPE sees
-        position 0 at every sample boundary. Cross-sample attention is blocked
-        by a document+causal `BlockMask` built via HF's helper. Requires the
-        model to be loaded with `attn_implementation="flex_attention"`.
+        `block_mask` and `position_embeddings` are layer-invariant for a
+        given microbatch. The engine builds them once per MB and passes
+        them in; standalone callers can omit them and we'll build from
+        `cu_seqlens` + the model's rotary emb (slower path, kept for
+        ergonomics/tests). Requires the model to be loaded with
+        `attn_implementation="flex_attention"`.
         """
-        from transformers.integrations.flex_attention import make_flex_block_causal_mask
-
         if hidden_states.shape[0] != 1:
             raise ValueError(
                 f"layer_forward_packed expects [1, T, H]; got batch={hidden_states.shape[0]}"
             )
+        if position_ids is None:
+            raise ValueError("layer_forward_packed requires position_ids")
 
-        # Per-token document IDs (1..N, with 0 reserved for pad — never present in packed input).
-        lengths = cu_seqlens[1:].to(torch.int64) - cu_seqlens[:-1].to(torch.int64)
-        n_docs = lengths.shape[0]
-        doc_ids = torch.repeat_interleave(
-            torch.arange(1, n_docs + 1, dtype=torch.int64, device=hidden_states.device),
-            lengths,
-        ).unsqueeze(0)  # [1, T]
-        block_mask = make_flex_block_causal_mask(doc_ids)
+        if block_mask is None:
+            if cu_seqlens is None:
+                raise ValueError(
+                    "layer_forward_packed requires either block_mask or cu_seqlens"
+                )
+            from transformers.integrations.flex_attention import (
+                make_flex_block_causal_mask,
+            )
+            lengths = cu_seqlens[1:].to(torch.int64) - cu_seqlens[:-1].to(torch.int64)
+            n_docs = lengths.shape[0]
+            doc_ids = torch.repeat_interleave(
+                torch.arange(
+                    1, n_docs + 1, dtype=torch.int64, device=hidden_states.device,
+                ),
+                lengths,
+            ).unsqueeze(0)
+            block_mask = make_flex_block_causal_mask(doc_ids)
 
-        rotary_emb = cast(Any, model).model.rotary_emb
-        position_embeddings = rotary_emb(hidden_states, position_ids)
+        if position_embeddings is None:
+            rotary_emb = cast(Any, model).model.rotary_emb
+            position_embeddings = rotary_emb(hidden_states, position_ids)
 
         needs_decompose = bool({"attn_out", "mlp_out"} & wanted_hooks)
         if not needs_decompose:

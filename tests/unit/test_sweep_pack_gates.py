@@ -109,3 +109,41 @@ def test_pack_false_default_unchanged() -> None:
         transport_dtype=torch.float32,
     )
     assert getattr(sweep, "pack", False) is False
+
+
+class _PackedNoLengthsCallback(Callback):
+    """Packed-mode callback that forgets to set sample_lengths on Emit.
+
+    Models the failure mode the dispatch-boundary assertion guards against:
+    if a packed callback returns a flat tensor with no offsets, downstream
+    storage has no way to reassemble per-sample slices.
+    """
+
+    accepts_packed = True
+    target_hooks = ("residual_post",)
+    phase = "read"
+
+    def on_batch(self, layer_idx, hook, acts, sample_ids):  # type: ignore[no-untyped-def]
+        from fpwap import Emit, RaggedTensor
+
+        rt = acts  # RaggedTensor under pack=True
+        assert isinstance(rt, RaggedTensor)
+        return Emit(tensor=rt.flat.detach().to(torch.float32).cpu())
+
+
+@pytest.mark.integration
+def test_pack_true_emit_without_sample_lengths_raises() -> None:
+    """Under pack=True, an Emit without sample_lengths must fail fast at dispatch."""
+    sweep = Sweep(
+        model=_llama_tiny_flex(),
+        dataset=_items(),
+        seq_len=8,
+        callbacks=[_PackedNoLengthsCallback()],
+        pack=True,
+        microbatch_size=2,
+        progress=False,
+        transport_dtype=torch.float32,
+        apply_final_norm=False,
+    )
+    with pytest.raises(RuntimeError, match="(?i)sample_lengths"):
+        sweep.run()
