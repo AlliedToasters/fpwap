@@ -566,6 +566,25 @@ class MemmapBackend:
         Skips the materialize-into-host-RAM round-trip in `read_all`. Useful
         when the caller already plans to mmap-read or move the file
         (cumulative emits across sweeps that won't fit in RAM).
+
+        Mid-sweep stability caveat: dest hardlinks share the inode with the
+        backend's file. Until `on_sweep_end()` finalizes the shard, that
+        inode is still being mutated:
+
+        * dense: a hardlink read mid-sweep sees in-progress writes (rows
+          for samples not yet emitted are zero-filled). Non-destructive.
+        * ragged: a subsequent drain after more samples arrive may rebuild
+          the final .bin via `mode="w+"` (memmap.py:362-368), which
+          truncates the inode — your hardlinked dest file gets trashed.
+
+        Content is stable only after `on_sweep_end()`. For per-sweep K-sweep
+        slicing (the workflow issue #70 motivates), call `path_for(dest=...)`
+        after the sweep ends — at that point ragged is finalized and the
+        cross-device-copy fallback path keeps the dest file intact regardless.
+
+        On dest collision (a file with the same name already exists in
+        `dest`): raises `FileExistsError`. Callers should use a fresh dest
+        dir per `path_for` call, or clean up the old file themselves.
         """
         key = (layer_idx, hook)
         if key not in self._shards:
@@ -584,8 +603,6 @@ class MemmapBackend:
             raise RuntimeError(
                 f"shard {shard.path.name!r} was never written to"
             )
-        else:
-            shard._mm.flush()
 
         data_path: Path = shard.path
         sidecar_path: Path | None = shard.path.with_suffix(".json")
@@ -624,9 +641,14 @@ def _link_or_copy(src: Path, dst: Path) -> Path:
     user holds a separate path with the same inode. If the destination
     is on another filesystem the kernel rejects the link with EXDEV; copy
     is the only option there.
+
+    Raises FileExistsError if `dst` already exists — surfacing the
+    collision is preferable to silently clobbering a previous handle the
+    caller may still be reading. The check is explicit so the cross-FS
+    copy path matches the same-FS hardlink path's semantics.
     """
     if dst.exists():
-        dst.unlink()
+        raise FileExistsError(dst)
     try:
         os.link(src, dst)
     except OSError as exc:

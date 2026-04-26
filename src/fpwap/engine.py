@@ -321,6 +321,19 @@ class Result:
                 pointing there. Backend keeps ownership of its original.
                 Requires a StorageBackend; raises otherwise.
         """
+        # Catch both `as_path=""` (falsy — would silently fall through to
+        # the in-memory branch and confuse the caller) and `as_path=Path("")`
+        # (truthy — would resolve to cwd and hardlink into the working dir).
+        # Path("").parts is () — distinguishes the empty Path from explicit
+        # Path(".") which a caller might genuinely intend.
+        if (
+            (isinstance(as_path, str) and not as_path)
+            or (isinstance(as_path, Path) and not as_path.parts)
+        ):
+            raise ValueError(
+                f"as_path string/Path must be non-empty (got {as_path!r}); "
+                "pass True for an in-place handle or an actual path"
+            )
         if as_path:
             if self.storage is None:
                 raise RuntimeError(

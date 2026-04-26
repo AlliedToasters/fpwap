@@ -101,6 +101,29 @@ def _read_dense_memmap(path: Path, sidecar: Path) -> Tensor:
     return t
 
 
+def _read_ragged_memmap(path: Path, sidecar: Path):
+    """Reconstruct a RaggedTensor from `(data_path, sidecar_path)` alone.
+
+    Mirrors `_read_dense_memmap` for the ragged layout — same purpose:
+    proves the on-disk artifact is self-describing (offsets in sidecar,
+    flat tensor in .bin) without going through any fpwap accessor.
+    """
+    from fpwap import RaggedTensor
+
+    meta = json.loads(sidecar.read_text())
+    assert meta["layout"] == "ragged"
+    per_row = tuple(meta["per_row_shape"])
+    bf16_as_u16 = bool(meta.get("bf16_as_u16", False))
+    np_dtype = np.uint16 if bf16_as_u16 else np.dtype(meta["dtype"])
+    offsets = torch.tensor(meta["offsets"], dtype=torch.int64)
+    total = int(offsets[-1].item())
+    mm = np.memmap(path, dtype=np_dtype, mode="r", shape=(total, *per_row))
+    flat = torch.from_numpy(np.asarray(mm))
+    if bf16_as_u16:
+        flat = flat.view(torch.bfloat16)
+    return RaggedTensor(flat=flat, offsets=offsets)
+
+
 @pytest.mark.integration
 def test_as_path_dense_inplace(tmp_path: Path) -> None:
     """as_path=True returns a ResultArtifact pointing at the backend's
@@ -233,6 +256,12 @@ def test_as_path_ragged_inplace(tmp_path: Path) -> None:
     assert isinstance(rt, RaggedTensor)
     assert int(rt.offsets[-1].item()) == sum(keep)
 
+    # Self-describing: third party reconstructs the same RaggedTensor
+    # from (data_path, sidecar_path) alone — symmetric with the dense test.
+    via_path = _read_ragged_memmap(art.data_path, art.sidecar_path)
+    assert torch.equal(via_path.flat, rt.flat)
+    assert torch.equal(via_path.offsets, rt.offsets)
+
 
 @pytest.mark.integration
 def test_as_path_ragged_hardlink_to_dest(tmp_path: Path) -> None:
@@ -266,6 +295,61 @@ def test_as_path_ragged_hardlink_to_dest(tmp_path: Path) -> None:
     meta = json.loads(art.sidecar_path.read_text())
     assert meta["layout"] == "ragged"
     assert meta["offsets"][-1] == sum(keep)
+
+    # Self-describing round-trip via the dest paths matches the live
+    # ragged accessor — same coverage the dense-dest test gives.
+    from fpwap import RaggedTensor
+
+    rt = result.activations(layer=1, hook="residual_post")
+    assert isinstance(rt, RaggedTensor)
+    via_path = _read_ragged_memmap(art.data_path, art.sidecar_path)
+    assert torch.equal(via_path.flat, rt.flat)
+    assert torch.equal(via_path.offsets, rt.offsets)
+
+
+@pytest.mark.integration
+def test_as_path_dest_collision_raises(tmp_path: Path) -> None:
+    """Two `path_for(dest=same_dir)` calls for the same shard collide on
+    the destination filename. We surface that with FileExistsError instead
+    of silently clobbering a previous handle the caller may still hold."""
+    from fpwap import Sweep
+    from fpwap.callbacks.common import RawActivations
+    from fpwap.storage.memmap import MemmapBackend
+
+    model = _tiny_gpt2()
+    backend_root = tmp_path / "backend"
+    dest = tmp_path / "user_dest"
+    dest.mkdir()
+    backend = MemmapBackend(root=backend_root)
+    result = Sweep(
+        model=model,
+        dataset=_dataset(),
+        seq_len=SEQ_LEN,
+        callbacks=[
+            RawActivations(layers="all", last_token_only=False, out_dtype=torch.float32)
+        ],
+        transport_dtype=torch.float32,
+        microbatch_size=2,
+        seed=SEED,
+        progress=False,
+        storage=backend,
+    ).run()
+
+    result.activations(layer=0, hook="residual_post", as_path=dest)
+    with pytest.raises(FileExistsError):
+        result.activations(layer=0, hook="residual_post", as_path=dest)
+
+
+@pytest.mark.parametrize("empty", ["", Path("")])
+def test_as_path_empty_raises(empty) -> None:
+    """as_path='' is falsy and would silently fall through to the in-memory
+    branch; as_path=Path('') is truthy and resolves to cwd → hardlinks
+    silently into the working dir. Both are config bugs — fail loud."""
+    from fpwap.engine import Result
+
+    res = Result(sweep_id="x")
+    with pytest.raises(ValueError, match="non-empty"):
+        res.activations(layer=0, hook="residual_post", as_path=empty)
 
 
 def test_as_path_without_storage_raises() -> None:
