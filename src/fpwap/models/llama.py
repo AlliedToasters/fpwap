@@ -23,6 +23,7 @@ class LlamaPlumbing:
     """
 
     uses_learned_positions: bool = False
+    supports_packed: bool = True
 
     def matches(self, model: nn.Module) -> bool:
         inner = getattr(model, "model", None)
@@ -111,6 +112,83 @@ class LlamaPlumbing:
         attn_output, _ = b.self_attn(
             hidden_states=h,
             attention_mask=ext_mask,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
+        if "attn_out" in wanted_hooks:
+            if dispatch_fn is not None:
+                attn_output = dispatch_fn("attn_out", attn_output)
+            else:
+                extras["attn_out"] = attn_output
+        h = residual + attn_output
+
+        residual = h
+        h = b.post_attention_layernorm(h)
+        mlp_output = b.mlp(h)
+        if "mlp_out" in wanted_hooks:
+            if dispatch_fn is not None:
+                mlp_output = dispatch_fn("mlp_out", mlp_output)
+            else:
+                extras["mlp_out"] = mlp_output
+        h = residual + mlp_output
+
+        return h, extras
+
+    def layer_forward_packed(
+        self,
+        model: nn.Module,
+        block: nn.Module,
+        hidden_states: Tensor,
+        cu_seqlens: Tensor,
+        position_ids: Tensor,
+        wanted_hooks: frozenset[str] = frozenset(),
+        dispatch_fn: Any = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Packed forward: `hidden_states` is `[1, sum(L_i), H]`.
+
+        Boundaries between samples come from `cu_seqlens` (`[N+1]` int32);
+        `position_ids` is `[1, sum(L_i)]` with per-sample resets so RoPE sees
+        position 0 at every sample boundary. Cross-sample attention is blocked
+        by a document+causal `BlockMask` built via HF's helper. Requires the
+        model to be loaded with `attn_implementation="flex_attention"`.
+        """
+        from transformers.integrations.flex_attention import make_flex_block_causal_mask
+
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                f"layer_forward_packed expects [1, T, H]; got batch={hidden_states.shape[0]}"
+            )
+
+        # Per-token document IDs (1..N, with 0 reserved for pad — never present in packed input).
+        lengths = cu_seqlens[1:].to(torch.int64) - cu_seqlens[:-1].to(torch.int64)
+        n_docs = lengths.shape[0]
+        doc_ids = torch.repeat_interleave(
+            torch.arange(1, n_docs + 1, dtype=torch.int64, device=hidden_states.device),
+            lengths,
+        ).unsqueeze(0)  # [1, T]
+        block_mask = make_flex_block_causal_mask(doc_ids)
+
+        rotary_emb = cast(Any, model).model.rotary_emb
+        position_embeddings = rotary_emb(hidden_states, position_ids)
+
+        needs_decompose = bool({"attn_out", "mlp_out"} & wanted_hooks)
+        if not needs_decompose:
+            out = block(
+                hidden_states,
+                attention_mask=block_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+            return cast(Tensor, out[0] if isinstance(out, tuple) else out), {}
+
+        b = cast(Any, block)
+        extras: dict[str, Tensor] = {}
+
+        residual = hidden_states
+        h = b.input_layernorm(hidden_states)
+        attn_output, _ = b.self_attn(
+            hidden_states=h,
+            attention_mask=block_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
         )
