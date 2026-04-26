@@ -234,6 +234,35 @@ def test_extractor_sweep_forwards_buffer_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+def test_extractor_sweep_forwards_pack(tmp_path: Path) -> None:
+    """Extractor.sweep(pack=True) forwards the kwarg to Sweep."""
+    from fpwap import Extractor
+    from fpwap.callbacks.common import RawActivations
+
+    snapshot_dir = tmp_path / "snapshot"
+    _write_tiny_gpt2_snapshot(snapshot_dir)
+
+    ext = Extractor.from_hf(str(snapshot_dir), dtype=torch.float32)
+
+    torch.manual_seed(SEED + 1)
+    input_ids = torch.randint(0, VOCAB, (N_SAMPLES, SEQ_LEN))
+
+    raw = RawActivations(layers="all", last_token_only=False, out_dtype=torch.float32)
+    sweep = ext.sweep(
+        dataset=[{"input_ids": input_ids[i : i + 1]} for i in range(N_SAMPLES)],
+        seq_len=SEQ_LEN,
+        callbacks=[raw],
+        transport_dtype=torch.float32,
+        execution_device="cpu",
+        seed=SEED,
+        apply_final_norm=False,
+        progress=False,
+        pack=True,
+    )
+    assert sweep.pack is True
+
+
+@pytest.mark.integration
 def test_extractor_requires_execution_device(tmp_path: Path) -> None:
     """Extractor.sweep() without execution_device must raise."""
     from fpwap import Extractor
