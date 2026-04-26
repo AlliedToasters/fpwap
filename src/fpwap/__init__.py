@@ -17,6 +17,7 @@ from fpwap.types import (
     Emit,
     LayerArtifact,
     RaggedTensor,
+    ResultArtifact,
     WriteBack,
 )
 
@@ -33,6 +34,7 @@ __all__ = [
     "ProfileReport",
     "RaggedTensor",
     "Result",
+    "ResultArtifact",
     "SetupTiming",
     "Sweep",
     "TeardownTiming",

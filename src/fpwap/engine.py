@@ -31,6 +31,7 @@ from fpwap.types import (
     LoadingStrategy,
     PaddingMode,
     RaggedTensor,
+    ResultArtifact,
     WriteBack,
 )
 
@@ -292,7 +293,13 @@ class Result:
     def artifact(self, kind: str, layer: int) -> Artifact:
         return self.artifacts[(kind, layer)]
 
-    def activations(self, layer: int, hook: HookName) -> Tensor | RaggedTensor:
+    def activations(
+        self,
+        layer: int,
+        hook: HookName,
+        *,
+        as_path: bool | str | Path = False,
+    ) -> Tensor | RaggedTensor | ResultArtifact:
         """Concatenate emitted activations for (layer, hook) in sample-id order.
 
         Requires at least one read-phase callback (e.g. RawActivations) to have
@@ -304,7 +311,38 @@ class Result:
         `RaggedTensor(flat, offsets)` when the callback supplied
         `Emit.sample_lengths`. Callers that may receive either layout must
         dispatch on `isinstance(result, RaggedTensor)`.
+
+        Args:
+            as_path: If False (default), return the materialized tensor.
+                If True, return a `ResultArtifact` pointing at the backend's
+                in-place file (caller mmap-reads on demand — issue #70).
+                If a Path/str, hardlink (or copy on EXDEV) the data file
+                and sidecar into that directory and return a `ResultArtifact`
+                pointing there. Backend keeps ownership of its original.
+                Requires a StorageBackend; raises otherwise.
         """
+        # Catch both `as_path=""` (falsy — would silently fall through to
+        # the in-memory branch and confuse the caller) and `as_path=Path("")`
+        # (truthy — would resolve to cwd and hardlink into the working dir).
+        # Path("").parts is () — distinguishes the empty Path from explicit
+        # Path(".") which a caller might genuinely intend.
+        if (
+            (isinstance(as_path, str) and not as_path)
+            or (isinstance(as_path, Path) and not as_path.parts)
+        ):
+            raise ValueError(
+                f"as_path string/Path must be non-empty (got {as_path!r}); "
+                "pass True for an in-place handle or an actual path"
+            )
+        if as_path:
+            if self.storage is None:
+                raise RuntimeError(
+                    "activations(as_path=...) requires a StorageBackend on "
+                    "the Sweep; no backend is wired so there is no on-disk "
+                    "file to hand out"
+                )
+            dest = Path(as_path) if not isinstance(as_path, bool) else None
+            return self.storage.path_for(layer, hook, dest=dest)
         if self.storage is not None:
             return self.storage.read_all(layer, hook)
         key = (layer, hook)

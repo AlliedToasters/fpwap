@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import torch
@@ -80,3 +81,34 @@ class Context:
     seq_len: int
     hidden: int
     transport_dtype: torch.dtype
+
+
+@dataclass(frozen=True)
+class ResultArtifact:
+    """On-disk handle returned by `Result.activations(..., as_path=True)`.
+
+    Lets a caller skip materializing the emit into a host-RAM tensor when
+    the consumer is going to read from disk anyway. The data file is
+    backend-owned (in-place mode) or hardlinked/copied into a user dir
+    (dest mode); ownership is never transferred.
+
+    Fields:
+        data_path:    The shard `.bin` file. mmap-readable.
+        sidecar_path: The `.json` sidecar with shape/dtype (and per-sample
+                      offsets for ragged). None only if a backend chose
+                      not to write one.
+        layout:       "dense" → `data_path` is `[N_samples, *per_row_shape]`.
+                      "ragged" → flat `[total_tokens, *trailing]`; per-sample
+                      offsets live in the sidecar.
+        dtype:        Logical torch dtype of the on-disk tensor. bf16 is
+                      stored as uint16 on disk; the sidecar `bf16_as_u16`
+                      flag tells you to `.view(torch.bfloat16)` after read.
+        shape:        Full tensor shape for dense; None for ragged (use
+                      sidecar offsets / `RaggedTensor.lengths`).
+    """
+
+    data_path: Path
+    sidecar_path: Path | None
+    layout: Literal["dense", "ragged"]
+    dtype: torch.dtype
+    shape: tuple[int, ...] | None
