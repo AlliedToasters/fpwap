@@ -85,6 +85,7 @@ class Extractor:
         chunk_size: int = 1,
         padding: PaddingMode = "fixed",
         buffer_path: str | Path | None = None,
+        pack: bool = False,
     ) -> Sweep:
         """Create a Sweep that reuses this Extractor's model and index."""
         from fpwap.engine import Sweep
@@ -109,5 +110,6 @@ class Extractor:
             chunk_size=chunk_size,
             padding=padding,
             buffer_path=buffer_path,
+            pack=pack,
             _accel_index=self._accel_index,
         )

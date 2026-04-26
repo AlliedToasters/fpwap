@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor, nn
@@ -588,6 +588,21 @@ def _max_capture_layer(callbacks: Sequence[Callback], n_layers: int) -> int:
     return deepest if deepest >= 0 else n_layers - 1
 
 
+def _packed_real_input_ids(items: list[Any]) -> Tensor:
+    """Concatenate per-item real-token ids into a flat [sum(L_i)] vector.
+
+    Each item is `{"input_ids": [1, max_seq], "attention_mask": [1, max_seq]}`.
+    Pad positions (mask == 0) are dropped. Used to feed the embed pass when
+    `Sweep(pack=True)`.
+    """
+    chunks: list[Tensor] = []
+    for it in items:
+        ids = it["input_ids"].squeeze(0)
+        mask = it["attention_mask"].squeeze(0).to(torch.bool)
+        chunks.append(ids[mask])
+    return torch.cat(chunks, dim=0)
+
+
 def _stack_field(items: list[Any], key: str) -> Tensor:
     """Collate a slice of dataset items along `key` into a single `(mb, seq)` tensor."""
     parts: list[Tensor] = []
@@ -601,7 +616,18 @@ def _stack_field(items: list[Any], key: str) -> Tensor:
 
 @dataclass
 class _Segment:
-    """A group of items with the same padded seq_len for the engine loop."""
+    """A group of items with the same padded seq_len for the engine loop.
+
+    When `is_packed=True`, the segment holds a single packed buffer covering
+    all items (no padding). `cu_seqlens` is `[N+1]` int64 with sample i's
+    rows at `flat[cu_seqlens[i]:cu_seqlens[i+1]]`. `seq_len` then represents
+    the maximum sample length (for shapes that need a scalar bound) and
+    `mask_buffer` is unused.
+
+    The `packed_*` tensors are flat segment-wide invariants computed once
+    at segment-build time and sliced per microbatch. Avoids rebuilding ids /
+    position_ids / doc_ids on every embed pass and every layer.
+    """
 
     seq_len: int
     items: list[Any]
@@ -609,6 +635,11 @@ class _Segment:
     buffer: ResidualBuffer
     mask_buffer: Tensor | None
     mb_size: int
+    is_packed: bool = False
+    cu_seqlens: Tensor | None = None
+    packed_input_ids: Tensor | None = None
+    packed_pos_ids: Tensor | None = None
+    packed_doc_ids: Tensor | None = None
 
     @property
     def n_samples(self) -> int:
@@ -693,7 +724,14 @@ def _build_bucketed_segments(
         seg_path: Path | None = None
         if buffer_path is not None:
             seg_path = buffer_path.with_stem(f"{buffer_path.stem}_seq{bseq}")
-        buf = ResidualBuffer(n, bseq, hidden, transport_dtype, buf_device, path=seg_path)
+        buf = ResidualBuffer(
+            n_samples=n,
+            seq_len=bseq,
+            hidden=hidden,
+            dtype=transport_dtype,
+            device=buf_device,
+            path=seg_path,
+        )
         pin = buf_device.type == "cpu" and torch.cuda.is_available()
         mask_buf = torch.zeros(
             (n, bseq), dtype=torch.int64, device=buf_device, pin_memory=pin,
@@ -868,6 +906,7 @@ class Sweep:
         apply_final_norm: bool = True,
         padding: PaddingMode = "fixed",
         chunk_size: int = 1,
+        pack: bool = False,
         _accel_index: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.model = model
@@ -886,6 +925,7 @@ class Sweep:
         self.apply_final_norm = apply_final_norm
         self.padding: PaddingMode = padding
         self.chunk_size = chunk_size
+        self.pack = pack
         self._accel_index = _accel_index
         self.execution_device = (
             torch.device(execution_device) if execution_device is not None else None
@@ -1139,6 +1179,36 @@ class Sweep:
         model.eval()
         plumbing = get_plumbing(model)
 
+        if self.pack:
+            if not getattr(plumbing, "supports_packed", False):
+                raise RuntimeError(
+                    f"pack=True requested but {type(plumbing).__name__} does "
+                    f"not support packed forward "
+                    f"(supports_packed=False). Use pack=False or run with a "
+                    f"Llama-family model."
+                )
+            non_packed = [
+                type(cb).__name__ for cb in self.callbacks
+                if not getattr(cb, "accepts_packed", False)
+            ]
+            if non_packed:
+                raise RuntimeError(
+                    f"pack=True requires every callback to set "
+                    f"accepts_packed=True (acts is delivered as RaggedTensor). "
+                    f"Callbacks missing the flag: {non_packed}"
+                )
+            if self.verify:
+                import warnings
+
+                warnings.warn(
+                    "Sweep(pack=True, verify=True) runs an extra full padded "
+                    "forward through every layer to compare against the packed "
+                    "path. Cost is roughly 2x a normal sweep; turn verify off "
+                    "for production runs.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
         _emit_progress("preloop_resolve_dataset", -1, 0, 0)
         if self.progress is True:
             sys.stderr.write("fpwap: resolving dataset...\n")
@@ -1216,7 +1286,55 @@ class Sweep:
             sys.stderr.write("fpwap: building segments and buffers...\n")
             sys.stderr.flush()
         t0 = time.perf_counter_ns()
-        if self.padding == "bucketed":
+        if self.pack:
+            if not has_mask:
+                raise ValueError(
+                    "pack=True requires attention_mask on every dataset item "
+                    "to determine real sequence lengths."
+                )
+            real_lengths = [
+                int(it["attention_mask"].sum().item()) for it in items
+            ]
+            cu_list: list[int] = [0]
+            for L in real_lengths:
+                cu_list.append(cu_list[-1] + L)
+            cu = torch.tensor(cu_list, dtype=torch.int64)
+            # Segment-wide flat tensors — built once, sliced per MB. The
+            # embed pass and per-MB hot path (BlockMask + position_embeddings
+            # build) read slices of these instead of re-deriving from items.
+            packed_ids = _packed_real_input_ids(items)
+            packed_pos_ids = torch.cat(
+                [torch.arange(L, dtype=torch.int64) for L in real_lengths],
+                dim=0,
+            )
+            packed_doc_ids = torch.repeat_interleave(
+                torch.arange(1, len(real_lengths) + 1, dtype=torch.int64),
+                torch.tensor(real_lengths, dtype=torch.int64),
+            )
+            buffer = ResidualBuffer(
+                n_samples=n_samples,
+                hidden=hidden,
+                dtype=self.transport_dtype,
+                device=buf_device,
+                path=self.buffer_path,
+                layout="packed",
+                cu_seqlens=cu,
+            )
+            segments = [_Segment(
+                seq_len=max(real_lengths) if real_lengths else 0,
+                items=items,
+                orig_indices=list(range(n_samples)),
+                buffer=buffer,
+                mask_buffer=None,
+                mb_size=mb_size,
+                is_packed=True,
+                cu_seqlens=cu,
+                packed_input_ids=packed_ids,
+                packed_pos_ids=packed_pos_ids,
+                packed_doc_ids=packed_doc_ids,
+            )]
+            left_padded = False
+        elif self.padding == "bucketed":
             if not has_mask:
                 raise ValueError(
                     "padding='bucketed' requires attention_mask on all dataset "
@@ -1311,15 +1429,31 @@ class Sweep:
             for seg in segments:
                 for start in range(0, seg.n_samples, seg.mb_size):
                     stop = min(start + seg.mb_size, seg.n_samples)
-                    input_ids = _stack_field(
-                        seg.items[start:stop], "input_ids"
-                    ).to(exec_device)
-                    embedded = plumbing.embed(model, input_ids)
-                    seg.buffer.write_slice(start, stop, embedded)
-                    if seg.mask_buffer is not None:
-                        seg.mask_buffer[start:stop] = _stack_field(
-                            seg.items[start:stop], "attention_mask"
-                        ).to(dtype=torch.int64)
+                    if seg.is_packed:
+                        # Pack the microbatch's real tokens into [1, T_real, ...].
+                        # Slice the segment-wide flat ids by row-range —
+                        # cu_seqlens translates the sample range for us.
+                        assert seg.cu_seqlens is not None
+                        assert seg.packed_input_ids is not None
+                        row_start = int(seg.cu_seqlens[start].item())
+                        row_stop = int(seg.cu_seqlens[stop].item())
+                        ids_real = seg.packed_input_ids[row_start:row_stop].to(
+                            exec_device
+                        )
+                        embedded = plumbing.embed(model, ids_real.unsqueeze(0))
+                        # write_slice translates [start, stop) sample-range to
+                        # rows via cu_seqlens — squeeze the batch dim away.
+                        seg.buffer.write_slice(start, stop, embedded.squeeze(0))
+                    else:
+                        input_ids = _stack_field(
+                            seg.items[start:stop], "input_ids"
+                        ).to(exec_device)
+                        embedded = plumbing.embed(model, input_ids)
+                        seg.buffer.write_slice(start, stop, embedded)
+                        if seg.mask_buffer is not None:
+                            seg.mask_buffer[start:stop] = _stack_field(
+                                seg.items[start:stop], "attention_mask"
+                            ).to(dtype=torch.int64)
         t0_embed_sync = time.perf_counter_ns()
         if exec_device.type == "cuda":
             torch.cuda.synchronize()
@@ -1390,6 +1524,12 @@ class Sweep:
                         dtype=self.transport_dtype, device=exec_device,
                     )
 
+            # Per-MB invariants for packed segments — built lazily on first
+            # touch within a chunk and reused across all layers in the chunk.
+            # Avoids rebuilding BlockMask + position_embeddings 80× per MB on
+            # an 80-layer model. Keyed by (id(seg), start).
+            packed_mb_cache: dict[tuple[int, int], dict[str, Any]] = {}
+
             n_batches = sum(
                 (seg.n_samples + seg.mb_size - 1) // seg.mb_size
                 for seg in segments
@@ -1437,6 +1577,10 @@ class Sweep:
                             dtype=torch.long,
                         )
 
+                        # Local cu_seqlens for the packed microbatch — set inside
+                        # the packed forward branch and reused in the post-forward
+                        # callback dispatch. Stays None on the dense path.
+                        mb_cu: Tensor | None = None
                         t_fwd = time.perf_counter_ns()
                         with torch.no_grad():
                             if has_scratch and not is_first_in_chunk:
@@ -1452,43 +1596,129 @@ class Sweep:
                                 if seg.mask_buffer is not None
                                 else None
                             )
-                            if dispatch_residual_pre:
-                                hidden_states, _pre_emit = self._dispatch_callbacks(
-                                    layer_idx,
-                                    "residual_pre",
-                                    hidden_states,
-                                    sample_ids_exec,
-                                    emits_sink=emits_sink,
-                                )
-                                timing.emit_s += _pre_emit
-                            inline_dispatch = None
-                            if needs_inline_sublayer_dispatch:
-                                def _inline(
-                                    hook_name: str,
-                                    tensor: Tensor,
-                                    _layer_idx: int = layer_idx,
-                                    _sample_ids: Tensor = sample_ids_exec,
-                                ) -> Tensor:
-                                    t, _e = self._dispatch_callbacks(
-                                        _layer_idx,
-                                        hook_name,  # type: ignore[arg-type]
-                                        tensor,
-                                        _sample_ids,
-                                        emits_sink=emits_sink,
-                                        write_allowed=True,
+                            if seg.is_packed:
+                                # Packed path: hidden_states is [T_real, H].
+                                # All per-MB invariants (cu_seqlens slice,
+                                # position_ids, BlockMask, RoPE cos/sin) are
+                                # cached for the duration of the chunk so each
+                                # layer just reads them.
+                                assert seg.cu_seqlens is not None
+                                cache_key = (id(seg), start)
+                                cached = packed_mb_cache.get(cache_key)
+                                if cached is None:
+                                    from transformers.integrations.flex_attention import (
+                                        make_flex_block_causal_mask,
                                     )
-                                    return t
+                                    assert seg.packed_pos_ids is not None
+                                    assert seg.packed_doc_ids is not None
+                                    row_start = int(seg.cu_seqlens[start].item())
+                                    row_stop = int(seg.cu_seqlens[stop].item())
+                                    mb_cu_local = (
+                                        seg.cu_seqlens[start : stop + 1]
+                                        - seg.cu_seqlens[start]
+                                    ).to(torch.int64)
+                                    mb_pos_ids = (
+                                        seg.packed_pos_ids[row_start:row_stop]
+                                        .to(exec_device, non_blocking=True)
+                                        .unsqueeze(0)
+                                    )
+                                    mb_doc_ids = (
+                                        seg.packed_doc_ids[row_start:row_stop]
+                                        .to(exec_device, non_blocking=True)
+                                        .unsqueeze(0)
+                                    )
+                                    mb_block_mask = make_flex_block_causal_mask(
+                                        mb_doc_ids
+                                    )
+                                    rotary_emb = (
+                                        cast(Any, model).model.rotary_emb
+                                    )
+                                    mb_pos_emb = rotary_emb(
+                                        hidden_states.unsqueeze(0), mb_pos_ids
+                                    )
+                                    cached = {
+                                        "mb_cu": mb_cu_local,
+                                        "pos_ids": mb_pos_ids,
+                                        "block_mask": mb_block_mask,
+                                        "pos_emb": mb_pos_emb,
+                                    }
+                                    packed_mb_cache[cache_key] = cached
+                                mb_cu = cached["mb_cu"]
+                                pos_ids = cached["pos_ids"]
+                                mb_block_mask = cached["block_mask"]
+                                mb_pos_emb = cached["pos_emb"]
 
-                                inline_dispatch = _inline
+                                acts_rt_pre = RaggedTensor(
+                                    flat=hidden_states, offsets=mb_cu.to(hidden_states.device)
+                                )
+                                if dispatch_residual_pre:
+                                    pre_acts, _pre_emit = self._dispatch_callbacks(
+                                        layer_idx,
+                                        "residual_pre",
+                                        acts_rt_pre,
+                                        sample_ids_exec,
+                                        emits_sink=emits_sink,
+                                        is_packed=True,
+                                    )
+                                    timing.emit_s += _pre_emit
+                                    if isinstance(pre_acts, RaggedTensor):
+                                        hidden_states = pre_acts.flat
+                                hidden_states_3d = hidden_states.unsqueeze(0)
+                                # layer_forward_packed lives only on plumbings
+                                # whose supports_packed=True. Dispatch via getattr
+                                # because the structural Protocol doesn't carry it.
+                                _packed_fwd = plumbing.layer_forward_packed  # type: ignore[attr-defined]
+                                hidden_states_3d, extras = _packed_fwd(
+                                    model,
+                                    block,
+                                    hidden_states_3d,
+                                    position_ids=pos_ids,
+                                    block_mask=mb_block_mask,
+                                    position_embeddings=mb_pos_emb,
+                                    wanted_hooks=sub_hooks,
+                                    dispatch_fn=None,
+                                )
+                                hidden_states = hidden_states_3d.squeeze(0)
+                            else:
+                                if dispatch_residual_pre:
+                                    pre_acts, _pre_emit = self._dispatch_callbacks(
+                                        layer_idx,
+                                        "residual_pre",
+                                        hidden_states,
+                                        sample_ids_exec,
+                                        emits_sink=emits_sink,
+                                    )
+                                    timing.emit_s += _pre_emit
+                                    if isinstance(pre_acts, Tensor):
+                                        hidden_states = pre_acts
+                                inline_dispatch = None
+                                if needs_inline_sublayer_dispatch:
+                                    def _inline(
+                                        hook_name: str,
+                                        tensor: Tensor,
+                                        _layer_idx: int = layer_idx,
+                                        _sample_ids: Tensor = sample_ids_exec,
+                                    ) -> Tensor:
+                                        t, _e = self._dispatch_callbacks(
+                                            _layer_idx,
+                                            hook_name,  # type: ignore[arg-type]
+                                            tensor,
+                                            _sample_ids,
+                                            emits_sink=emits_sink,
+                                            write_allowed=True,
+                                        )
+                                        return t  # type: ignore[return-value]
 
-                            hidden_states, extras = plumbing.layer_forward_with_hooks(
-                                model,
-                                block,
-                                hidden_states,
-                                attention_mask=mb_mask,
-                                wanted_hooks=sub_hooks,
-                                dispatch_fn=inline_dispatch,
-                            )
+                                    inline_dispatch = _inline
+
+                                hidden_states, extras = plumbing.layer_forward_with_hooks(
+                                    model,
+                                    block,
+                                    hidden_states,
+                                    attention_mask=mb_mask,
+                                    wanted_hooks=sub_hooks,
+                                    dispatch_fn=inline_dispatch,
+                                )
                         timing.forward_s += (time.perf_counter_ns() - t_fwd) / 1e9
 
                         if final_norm is not None and layer_idx == n_layers - 1:
@@ -1496,26 +1726,60 @@ class Sweep:
 
                         t_cb = time.perf_counter_ns()
                         mb_emit_s = 0.0
-                        for sub_hook, sub_tensor in extras.items():
-                            _, _sub_emit = self._dispatch_callbacks(
+                        if seg.is_packed:
+                            # Wrap each post-forward tensor as RaggedTensor before
+                            # handing to callbacks. mb_cu is in [N+1] form on the
+                            # exec device; emits use the same offsets so callbacks
+                            # can extract per-sample slices.
+                            assert mb_cu is not None
+                            mb_cu_for_emit = mb_cu.to(hidden_states.device)
+                            for sub_hook, sub_tensor in extras.items():
+                                sub_flat = sub_tensor.squeeze(0)
+                                _, _sub_emit = self._dispatch_callbacks(
+                                    layer_idx,
+                                    sub_hook,
+                                    RaggedTensor(flat=sub_flat, offsets=mb_cu_for_emit),
+                                    sample_ids_exec,
+                                    emits_sink=emits_sink,
+                                    write_allowed=False,
+                                    is_packed=True,
+                                )
+                                mb_emit_s += _sub_emit
+                            post_acts, _post_emit = self._dispatch_callbacks(
                                 layer_idx,
-                                sub_hook,  # type: ignore[arg-type]
-                                sub_tensor,
+                                "residual_post",
+                                RaggedTensor(flat=hidden_states, offsets=mb_cu_for_emit),
                                 sample_ids_exec,
                                 emits_sink=emits_sink,
-                                write_allowed=False,
+                                is_packed=True,
                             )
-                            mb_emit_s += _sub_emit
-                        hidden_states, _post_emit = self._dispatch_callbacks(
-                            layer_idx,
-                            "residual_post",
-                            hidden_states,
-                            sample_ids_exec,
-                            emits_sink=emits_sink,
-                        )
-                        mb_emit_s += _post_emit
+                            if isinstance(post_acts, RaggedTensor):
+                                hidden_states = post_acts.flat
+                            mb_emit_s += _post_emit
+                        else:
+                            for sub_hook, sub_tensor in extras.items():
+                                _, _sub_emit = self._dispatch_callbacks(
+                                    layer_idx,
+                                    sub_hook,
+                                    sub_tensor,
+                                    sample_ids_exec,
+                                    emits_sink=emits_sink,
+                                    write_allowed=False,
+                                )
+                                mb_emit_s += _sub_emit
+                            post_acts, _post_emit = self._dispatch_callbacks(
+                                layer_idx,
+                                "residual_post",
+                                hidden_states,
+                                sample_ids_exec,
+                                emits_sink=emits_sink,
+                            )
+                            if isinstance(post_acts, Tensor):
+                                hidden_states = post_acts
+                            mb_emit_s += _post_emit
                         timing.emit_s += mb_emit_s
-                        if verify_baseline is not None:
+                        if verify_baseline is not None and not seg.is_packed:
+                            assert isinstance(hidden_states, Tensor)
                             expected = verify_baseline[layer_idx][start:stop].to(
                                 device=hidden_states.device, dtype=hidden_states.dtype
                             )
@@ -1611,6 +1875,7 @@ class Sweep:
             t0_unload = time.perf_counter_ns()
             if gpu_scratch:
                 del gpu_scratch
+            packed_mb_cache.clear()
             for li in chunk:
                 streamer.unload_layer(model, li, plumbing)
             profile.unload_s += (time.perf_counter_ns() - t0_unload) / 1e9
@@ -1697,16 +1962,20 @@ class Sweep:
         self,
         layer_idx: int,
         hook: HookName,
-        acts: Tensor,
+        acts: Tensor | RaggedTensor,
         sample_ids: Tensor,
         emits_sink: dict[
             tuple[int, str], list[tuple[Tensor, Tensor, Tensor | None]]
         ] | None = None,
         write_allowed: bool = True,
-    ) -> tuple[Tensor, float]:
+        is_packed: bool = False,
+    ) -> tuple[Tensor | RaggedTensor, float]:
         """Phase-ordered dispatch: read → write (sequential) → read_after_write.
 
-        Returns (possibly modified activations, emit_write_seconds).
+        Returns (possibly modified activations, emit_write_seconds). Under
+        `is_packed=True`, `acts` is a `RaggedTensor` (engine ran a packed
+        forward) and the auto-pad-to-seq_len pad block is bypassed because
+        the emit is already at native shape.
         """
         emit_s = 0.0
 
@@ -1714,16 +1983,23 @@ class Sweep:
         for cb in self.callbacks:
             if cb.phase != "read" or not _callback_applies(cb, layer_idx, hook):
                 continue
-            result = cb.on_batch(layer_idx, hook, acts, sample_ids)
+            result = cb.on_batch(layer_idx, hook, acts, sample_ids)  # type: ignore[arg-type]
             if isinstance(result, WriteBack):
                 raise ValueError(
                     f"read-phase callback {type(cb).__name__} returned WriteBack"
                 )
             if isinstance(result, Emit):
                 ragged_lengths = result.sample_lengths
+                if is_packed and ragged_lengths is None:
+                    raise RuntimeError(
+                        f"callback {type(cb).__name__} returned an Emit "
+                        f"without sample_lengths under Sweep(pack=True); "
+                        f"ragged emit lengths are required to reassemble "
+                        f"per-sample slices in packed mode"
+                    )
                 if self.storage is not None:
                     emit_tensor = result.tensor
-                    if ragged_lengths is None and (
+                    if not is_packed and ragged_lengths is None and (
                         emit_tensor.dim() >= 2
                         and emit_tensor.shape[1] < self.seq_len
                     ):
@@ -1763,7 +2039,13 @@ class Sweep:
                     f"{hook!r}, but WriteBack at sub-layer hooks isn't wired. "
                     f"Use residual_pre or residual_post for steering."
                 )
-            result = cb.on_batch(layer_idx, hook, acts, sample_ids)
+            if is_packed:
+                raise NotImplementedError(
+                    f"write-phase callback {type(cb).__name__} is not "
+                    "supported under Sweep(pack=True) in the pack pilot. "
+                    "Use pack=False or move steering to a read-phase setup."
+                )
+            result = cb.on_batch(layer_idx, hook, acts, sample_ids)  # type: ignore[arg-type]
             if isinstance(result, WriteBack):
                 acts = result.tensor
 
@@ -1771,7 +2053,7 @@ class Sweep:
         for cb in self.callbacks:
             if cb.phase != "read_after_write" or not _callback_applies(cb, layer_idx, hook):
                 continue
-            result = cb.on_batch(layer_idx, hook, acts, sample_ids)
+            result = cb.on_batch(layer_idx, hook, acts, sample_ids)  # type: ignore[arg-type]
             if isinstance(result, WriteBack):
                 raise ValueError(
                     f"read_after_write-phase callback {type(cb).__name__} returned WriteBack"

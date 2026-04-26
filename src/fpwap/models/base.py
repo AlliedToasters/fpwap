@@ -12,6 +12,7 @@ class ModelPlumbing(Protocol):
     """Per-family hook plumbing. Implementations live in fpwap/models/<family>.py."""
 
     uses_learned_positions: bool
+    supports_packed: bool
 
     def matches(self, model: nn.Module) -> bool: ...
 

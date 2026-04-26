@@ -11,6 +11,7 @@ class GPT2Plumbing:
     """Hook plumbing for HuggingFace GPT-2 family (`GPT2LMHeadModel`, `GPT2Model`)."""
 
     uses_learned_positions: bool = True
+    supports_packed: bool = False
 
     def matches(self, model: nn.Module) -> bool:
         transformer = getattr(model, "transformer", None)

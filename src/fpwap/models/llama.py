@@ -23,6 +23,7 @@ class LlamaPlumbing:
     """
 
     uses_learned_positions: bool = False
+    supports_packed: bool = True
 
     def matches(self, model: nn.Module) -> bool:
         inner = getattr(model, "model", None)
@@ -111,6 +112,96 @@ class LlamaPlumbing:
         attn_output, _ = b.self_attn(
             hidden_states=h,
             attention_mask=ext_mask,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
+        if "attn_out" in wanted_hooks:
+            if dispatch_fn is not None:
+                attn_output = dispatch_fn("attn_out", attn_output)
+            else:
+                extras["attn_out"] = attn_output
+        h = residual + attn_output
+
+        residual = h
+        h = b.post_attention_layernorm(h)
+        mlp_output = b.mlp(h)
+        if "mlp_out" in wanted_hooks:
+            if dispatch_fn is not None:
+                mlp_output = dispatch_fn("mlp_out", mlp_output)
+            else:
+                extras["mlp_out"] = mlp_output
+        h = residual + mlp_output
+
+        return h, extras
+
+    def layer_forward_packed(
+        self,
+        model: nn.Module,
+        block: nn.Module,
+        hidden_states: Tensor,
+        cu_seqlens: Tensor | None = None,
+        position_ids: Tensor | None = None,
+        block_mask: Any = None,
+        position_embeddings: tuple[Tensor, Tensor] | None = None,
+        wanted_hooks: frozenset[str] = frozenset(),
+        dispatch_fn: Any = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Packed forward: `hidden_states` is `[1, sum(L_i), H]`.
+
+        `block_mask` and `position_embeddings` are layer-invariant for a
+        given microbatch. The engine builds them once per MB and passes
+        them in; standalone callers can omit them and we'll build from
+        `cu_seqlens` + the model's rotary emb (slower path, kept for
+        ergonomics/tests). Requires the model to be loaded with
+        `attn_implementation="flex_attention"`.
+        """
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                f"layer_forward_packed expects [1, T, H]; got batch={hidden_states.shape[0]}"
+            )
+        if position_ids is None:
+            raise ValueError("layer_forward_packed requires position_ids")
+
+        if block_mask is None:
+            if cu_seqlens is None:
+                raise ValueError(
+                    "layer_forward_packed requires either block_mask or cu_seqlens"
+                )
+            from transformers.integrations.flex_attention import (
+                make_flex_block_causal_mask,
+            )
+            lengths = cu_seqlens[1:].to(torch.int64) - cu_seqlens[:-1].to(torch.int64)
+            n_docs = lengths.shape[0]
+            doc_ids = torch.repeat_interleave(
+                torch.arange(
+                    1, n_docs + 1, dtype=torch.int64, device=hidden_states.device,
+                ),
+                lengths,
+            ).unsqueeze(0)
+            block_mask = make_flex_block_causal_mask(doc_ids)
+
+        if position_embeddings is None:
+            rotary_emb = cast(Any, model).model.rotary_emb
+            position_embeddings = rotary_emb(hidden_states, position_ids)
+
+        needs_decompose = bool({"attn_out", "mlp_out"} & wanted_hooks)
+        if not needs_decompose:
+            out = block(
+                hidden_states,
+                attention_mask=block_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+            return cast(Tensor, out[0] if isinstance(out, tuple) else out), {}
+
+        b = cast(Any, block)
+        extras: dict[str, Tensor] = {}
+
+        residual = hidden_states
+        h = b.input_layernorm(hidden_states)
+        attn_output, _ = b.self_attn(
+            hidden_states=h,
+            attention_mask=block_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
         )

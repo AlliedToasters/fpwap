@@ -22,6 +22,11 @@ class Callback:
     phase: Phase = "read"
     needs_grad: bool = False
     accum_dtype: torch.dtype = torch.float32
+    # Set True if `on_batch` can accept `acts: RaggedTensor` (used under
+    # `Sweep(pack=True)`). Default False keeps existing dense callbacks safe;
+    # the engine raises if pack=True is requested with any callback that
+    # hasn't opted in.
+    accepts_packed: bool = False
 
     def on_sweep_start(self, ctx: Context) -> None:
         return None
