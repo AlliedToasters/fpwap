@@ -157,6 +157,10 @@ result.profile.bytes_moved()        # weight I/O, buffer I/O
 
 Interactive progress is on by default — a tqdm-style bar across layers × batches, because a run on the workstation under your desk should not sit silent for 40 minutes. Disable with `progress=False`; pass a callable (`progress=my_reporter`) to stream events into wandb, rich, or any other backend.
 
+### Known cliff: CUDA allocator fragmentation on K-sweep configs
+
+If a K-sweep run on tight VRAM (K-packed sweeps, `chunk_size=1`, large per-K residual buffer) shows episodic multi-minute pauses every few sweeps with the process stuck in D-state but NVMe mostly idle in `iostat`, the cause is almost certainly CUDA caching-allocator fragmentation, not host I/O. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before launch — segments grow contiguously on demand and the cliff disappears (verified on a 70B / K=30 / 14k repro: 2:20 → 0:55 wall, no other change). See [#72](https://github.com/AlliedToasters/fpwap/issues/72) for the diagnostic walk.
+
 ## Reference callbacks
 
 Four callbacks ship with the library as examples and integration tests:
