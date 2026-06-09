@@ -1,8 +1,11 @@
 name: release
 
-# Tag and create a GitHub release whenever main lands with a pyproject
-# version that has no tag yet. Releasing = bumping `version` in
-# pyproject.toml; merges that don't bump are no-ops here.
+# Tag, create a GitHub release, and publish to PyPI whenever main lands
+# with a pyproject version that has no tag yet. Releasing = bumping
+# `version` in pyproject.toml; merges that don't bump are no-ops here.
+#
+# PyPI auth is trusted publishing (OIDC) — registered on pypi.org for
+# this repo + workflow + the `pypi` environment. No tokens.
 
 on:
   push:
@@ -14,6 +17,9 @@ permissions:
 jobs:
   tag-release:
     runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,16 +29,38 @@ jobs:
           echo "version=$(grep -Po '(?<=^version = ")[^"]*' pyproject.toml)" >> "$GITHUB_OUTPUT"
 
       - name: Create release if tag missing
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${{ steps.version.outputs.version }}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $tag already exists — skipping"
+            echo "released=false" >> "$GITHUB_OUTPUT"
           else
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "fpwap $tag" \
               --generate-notes
+            echo "released=true" >> "$GITHUB_OUTPUT"
           fi
+
+  publish-pypi:
+    needs: tag-release
+    if: needs.tag-release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC for PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
