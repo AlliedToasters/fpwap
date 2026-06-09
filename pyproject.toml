@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fpwap"
-version = "0.0.0"
+version = "0.1.0"
 description = "Forward Pass Weight Amortization Protocol — invert the inference loop for large transformer models."
 readme = "README.md"
 requires-python = ">=3.11"
