@@ -124,6 +124,10 @@ class LlamaPlumbing:
         residual = h
         h = b.post_attention_layernorm(h)
         mlp_output = b.mlp(h)
+        if isinstance(mlp_output, tuple):
+            # MoE sparse blocks on transformers < 5.6 return
+            # (hidden_states, router_logits); the residual add needs the tensor.
+            mlp_output = mlp_output[0]
         if "mlp_out" in wanted_hooks:
             if dispatch_fn is not None:
                 mlp_output = dispatch_fn("mlp_out", mlp_output)

@@ -680,3 +680,11 @@ The residual buffer is populated by running the embedding layer over the whole d
 ### D.6 Attention mask shape assumptions
 
 Some HF model implementations expect a 2D `attention_mask`; others broadcast a 4D causal mask internally. When you call `model.layers[i](x)` directly (bypassing the top-level forward), you may have to construct the mask yourself in the shape the layer expects. Model-family-specific; document per family in `fpwap.models.*`.
+
+### D.7 Checkpoint layout ≠ module layout under transformers ≥ 5
+
+The keys in the safetensors shards are not always the module parameter names. transformers ≥ 5 reconciles them through a global `WeightConverter` mapping inside `from_pretrained` — e.g. every current HF MoE checkpoint stores per-expert `mlp.experts.E.{gate_proj,up_proj,down_proj}.weight`, while the instantiated module holds fused stacked `mlp.experts.{gate_up_proj,down_proj}`. An index built from raw shard keys is missing those module params, and the set grows silently as transformers registers more conversions.
+
+fpwap resolves module params through the same mapping at index-build time (`build_conversion_plans`) and fuses the source tensors on demand at load time (`ConvertingWeightsLoader`), preserving the natural-sort collection order `from_pretrained` uses — expert stacking order depends on it. Per-layer fusion cost is small relative to NVMe read time.
+
+Symptom: `KeyError: 'model.layers.0.mlp.experts.gate_up_proj'` in `_load_layer`.
