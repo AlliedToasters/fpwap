@@ -8,16 +8,10 @@ decomposed path is version-robust (issue #77, related item).
 """
 from __future__ import annotations
 
-import pytest
 import torch
 from torch import Tensor, nn
 
 from fpwap.models.llama import LlamaPlumbing
-
-# TODO(#77): remove once the tuple-unwrap guard lands.
-pytestmark = pytest.mark.xfail(
-    strict=True, reason="issue #77: decomposed path lacks MoE tuple unwrap"
-)
 
 HIDDEN = 8
 

@@ -120,8 +120,18 @@ def test_moe_streaming_matches_preloaded(tmp_path: Path) -> None:
             self.acts[layer_idx][sample_ids] = acts.detach()
             return None
 
-    # Run A: pre-loaded model (weights fused by from_pretrained itself).
-    preloaded = src.to("cuda:0")
+    del src
+
+    # Run A: pre-loaded model, fused by from_pretrained's own conversion.
+    # NOT the in-memory src: `.to(bf16)` on it would also cast the fp32
+    # rotary inv_freq buffer, which from_config-built streaming models keep
+    # in fp32 — a ULP-level RoPE mismatch that has nothing to do with #77.
+    from transformers import AutoModelForCausalLM
+
+    preloaded = AutoModelForCausalLM.from_pretrained(
+        snapshot_dir, dtype=torch.bfloat16
+    ).to("cuda:0")
+    preloaded.eval()
     cap_pre = Capture()
     Sweep(
         model=preloaded,
@@ -134,7 +144,7 @@ def test_moe_streaming_matches_preloaded(tmp_path: Path) -> None:
         progress=False,
     ).run()
 
-    del preloaded, src
+    del preloaded
     torch.cuda.empty_cache()
 
     # Run B: streaming from the per-expert snapshot — the #77 repro path.

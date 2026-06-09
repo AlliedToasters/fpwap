@@ -480,14 +480,34 @@ class _OffloadStreamer(_LayerStreamer):
 
     execution_device: torch.device  # non-None; overrides base's Optional
 
-    def __init__(self, accel_index: dict[str, Any], execution_device: torch.device) -> None:
+    def __init__(
+        self,
+        accel_index: dict[str, Any],
+        execution_device: torch.device,
+        model: nn.Module | None = None,
+    ) -> None:
         from accelerate.utils import OffloadedWeightsLoader
 
+        from fpwap.loader import ConvertingWeightsLoader, build_conversion_plans
+
         self.execution_device = execution_device
-        self._loader = OffloadedWeightsLoader(index=accel_index)
+        # Plans must be built before the loader: transformers' checkpoint
+        # conversions can alias renamed keys into accel_index, and
+        # OffloadedWeightsLoader caches the index at construction (SPEC D.3).
+        plans = build_conversion_plans(model, accel_index) if model is not None else {}
+        loader: Any = OffloadedWeightsLoader(index=accel_index)
+        if plans:
+            loader = ConvertingWeightsLoader(
+                loader, plans, config=getattr(model, "config", None)
+            )
+        self._loader = loader
         self._accel_index = accel_index
         self.last_load_bytes = 0
-        self._advisor = ShardPageAdvisor(accel_index)
+        virtual_sources = {
+            target: [key for key, _ in plan.sources]
+            for target, plan in plans.items()
+        }
+        self._advisor = ShardPageAdvisor(accel_index, virtual_sources=virtual_sources)
         # Single-worker pool: next layer's load runs on a worker thread so
         # safetensors read + H2D overlap with the main thread's compute on
         # the current layer. Modern GPUs have a separate copy engine, so
@@ -1060,7 +1080,13 @@ class Sweep:
                         "execution_device is required when using a pre-built accel_index "
                         "(Extractor path)"
                     )
-                return self.model, _OffloadStreamer(self._accel_index, self.execution_device), None
+                return (
+                    self.model,
+                    _OffloadStreamer(
+                        self._accel_index, self.execution_device, model=self.model
+                    ),
+                    None,
+                )
             return self.model, _PreloadedStreamer(self.execution_device), None
         if isinstance(self.model, str):
             if self.execution_device is None:
@@ -1088,7 +1114,9 @@ class Sweep:
                 index_s=build_timing["index_s"],
                 total_s=resolve_s + sum(build_timing.values()),
             )
-            streamer = _OffloadStreamer(accel_index, self.execution_device)
+            streamer = _OffloadStreamer(
+                accel_index, self.execution_device, model=model
+            )
             return model, streamer, setup
         got = type(self.model).__name__
         raise TypeError(

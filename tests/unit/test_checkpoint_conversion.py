@@ -22,11 +22,6 @@ from safetensors.torch import save_file
 
 pytest.importorskip("transformers.conversion_mapping")
 
-# TODO(#77): remove once the conversion plumbing lands.
-pytestmark = pytest.mark.xfail(
-    strict=True, reason="issue #77: checkpoint conversion not yet implemented"
-)
-
 
 def _write_tiny_qwen3_moe_snapshot(tmp_path: Path) -> tuple[torch.nn.Module, Path]:
     """Save a tiny Qwen3-MoE in the on-disk per-expert layout.

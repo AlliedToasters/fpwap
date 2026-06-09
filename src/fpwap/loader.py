@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import struct
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from huggingface_hub import snapshot_download
@@ -126,6 +128,166 @@ def alias_tied_weights_in_index(
             source_entry = accel_index[sources[0]]
             for t in targets:
                 accel_index[t] = source_entry
+
+
+@dataclass
+class WeightConversionPlan:
+    """Recipe to realize one converted module param from raw checkpoint keys.
+
+    `converter` is the transformers WeightTransform that owns the conversion
+    (e.g. MergeModulelist + Concatenate for fused MoE experts). It is a
+    template: transformers' transforms accumulate per-load state, so every
+    materialization deep-copies it first. `sources` preserves the natural-sort
+    order `from_pretrained` collects tensors in — expert stacking order
+    depends on it. `targets` lists every full module-param name the convert
+    realizes (one-to-many converters like qkv-split produce several).
+    """
+
+    converter: Any
+    sources: list[tuple[str, str]] = field(default_factory=list)
+    targets: list[str] = field(default_factory=list)
+
+
+def build_conversion_plans(
+    model: nn.Module,
+    accel_index: dict[str, dict[str, Any]],
+) -> dict[str, WeightConversionPlan]:
+    """Map module param names to conversion plans over raw checkpoint keys.
+
+    transformers ≥5 reconciles checkpoints whose on-disk layout differs from
+    the instantiated modules (all current HF MoE checkpoints: per-expert
+    tensors on disk, fused stacked params in the module) through a global
+    WeightConverter mapping applied inside `from_pretrained`. fpwap's index
+    is built from raw safetensors keys, so module params produced by such a
+    conversion are missing from it — resolve them here so the streaming
+    loader can fuse on demand (issue #77).
+
+    Returns {} when the installed transformers has no conversion machinery
+    (<5.x — layouts match by construction there) or when every module param
+    resolves directly against the index. Keys are full module-param names;
+    plans for one-to-many converters are shared across their targets.
+    """
+    try:
+        from transformers.conversion_mapping import get_model_conversion_mapping
+        from transformers.core_model_loading import (
+            WeightConverter,
+            WeightRenaming,
+            dot_natural_key,
+            rename_source_key,
+        )
+    except ImportError:
+        return {}
+
+    # Annotated for PreTrainedModel upstream, but only walks named_modules —
+    # safe for any nn.Module (non-HF modules just get the legacy renames).
+    weight_mapping = get_model_conversion_mapping(cast(Any, model))
+    renamings = [m for m in weight_mapping if isinstance(m, WeightRenaming)]
+    converters = [m for m in weight_mapping if isinstance(m, WeightConverter)]
+    if not renamings and not converters:
+        return {}
+
+    meta_state_dict = model.state_dict()
+    prefix = getattr(model, "base_model_prefix", None)
+    pattern_to_converter = {
+        pattern: converter
+        for converter in converters
+        for pattern in converter.source_patterns
+    }
+
+    grouped: dict[str, WeightConversionPlan] = {}
+    for original_key in sorted(accel_index, key=dot_natural_key):
+        renamed_key, source_pattern = rename_source_key(
+            original_key, renamings, converters, prefix, meta_state_dict
+        )
+        if renamed_key not in meta_state_dict and original_key in meta_state_dict:
+            # Mirrors from_pretrained: the key matched a pattern but the
+            # renamed form doesn't exist — it shouldn't have been renamed.
+            renamed_key, source_pattern = rename_source_key(
+                original_key, [], [], prefix, meta_state_dict
+            )
+        if renamed_key not in meta_state_dict:
+            continue
+        if source_pattern is None:
+            if renamed_key != original_key and renamed_key not in accel_index:
+                # Pure renaming (legacy keys, prefix moves): same bytes under
+                # a new name — alias the index entry like tied weights.
+                accel_index[renamed_key] = accel_index[original_key]
+            continue
+        converter = pattern_to_converter[source_pattern]
+        plan = grouped.setdefault(renamed_key, WeightConversionPlan(converter))
+        plan.sources.append((original_key, source_pattern))
+
+    plans: dict[str, WeightConversionPlan] = {}
+    for first_target, plan in grouped.items():
+        # One-to-many converters realize every target in one convert() call;
+        # expose the plan under each full target name (transformers derives
+        # them the same way for its unexpected-keys accounting).
+        target_patterns = plan.converter.target_patterns
+        plan.targets = [
+            first_target.replace(target_patterns[0], pattern)
+            for pattern in target_patterns
+        ]
+        for target in plan.targets:
+            plans[target] = plan
+    return plans
+
+
+class ConvertingWeightsLoader:
+    """Dict-like loader that resolves converted module params on demand.
+
+    Raw checkpoint keys pass straight through to the wrapped
+    OffloadedWeightsLoader; module param names that only exist after
+    transformers' checkpoint conversion (fused MoE experts, split qkv, ...)
+    are materialized by loading their source tensors and running the
+    registered conversion, exactly as `from_pretrained` would. Sibling
+    outputs of one-to-many converts are cached until first read so each
+    source tensor is read from disk once.
+    """
+
+    def __init__(
+        self,
+        base: Any,
+        plans: dict[str, WeightConversionPlan],
+        config: Any = None,
+    ) -> None:
+        self._base = base
+        self._plans = plans
+        self._config = config
+        self._realized: dict[str, torch.Tensor] = {}
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._base or key in self._plans
+
+    def keys(self) -> list[str]:
+        return list(self._base.keys()) + list(self._plans.keys())
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        if key in self._base:
+            return self._base[key]  # type: ignore[no-any-return]
+        if key in self._realized:
+            return self._realized.pop(key)
+        plan = self._plans.get(key)
+        if plan is None:
+            raise KeyError(
+                f"{key!r} is neither a checkpoint weight nor a converted "
+                f"module param — the snapshot may not match the instantiated "
+                f"model under the installed transformers version"
+            )
+        converter = copy.deepcopy(plan.converter)
+        first_target = plan.targets[0]
+        for source_key, source_pattern in plan.sources:
+            # Callables → transformers' sync materialization path; the read
+            # from disk happens inside convert(), one source at a time.
+            converter.add_tensor(
+                first_target,
+                source_key,
+                source_pattern,
+                lambda source_key=source_key: self._base[source_key],
+            )
+        realized = converter.convert(first_target, config=self._config)
+        for name, value in realized.items():
+            self._realized[name] = value[0] if isinstance(value, list) else value
+        return self._realized.pop(key)
 
 
 def build_empty_model_and_index(
@@ -302,10 +464,20 @@ class ShardPageAdvisor:
     Uses posix_fadvise(DONTNEED) after a layer is unloaded so the kernel
     can reclaim those pages for upcoming layers. On non-Linux platforms
     (no posix_fadvise), all methods are silent no-ops.
+
+    `virtual_sources` maps module param names that don't exist on disk
+    (converted weights, e.g. fused MoE experts) to the raw checkpoint keys
+    backing them, so advising on the module name reaches the real byte
+    ranges.
     """
 
-    def __init__(self, accel_index: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        accel_index: dict[str, dict[str, Any]],
+        virtual_sources: dict[str, list[str]] | None = None,
+    ) -> None:
         self._offsets: dict[str, tuple[str, int, int]] = {}
+        self._virtual_sources = virtual_sources or {}
         if not _HAS_POSIX_FADVISE:
             return
 
@@ -328,7 +500,10 @@ class ShardPageAdvisor:
         if not _HAS_POSIX_FADVISE:
             return
         by_shard: dict[str, list[tuple[int, int]]] = {}
+        expanded: list[str] = []
         for name in weight_names:
+            expanded.extend(self._virtual_sources.get(name, (name,)))
+        for name in expanded:
             if name not in self._offsets:
                 continue
             path, start, end = self._offsets[name]
