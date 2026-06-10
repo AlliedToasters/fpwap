@@ -75,17 +75,29 @@ class LlamaPlumbing:
         position_embeddings = rotary_emb(hidden_states, position_ids)
 
         # 2D padding mask → combined causal+padding 4D for SDPA.
+        # Exception: right-padded inputs need no mask at all under causal
+        # attention — every pad key lies in the future of every real query,
+        # so masking is redundant, and pad-row outputs are garbage either
+        # way (callers slice to real lengths). Skipping the dense 4D mask
+        # keeps SDPA on its fused causal path, so real-token outputs match
+        # the unpadded forward bit-for-bit instead of drifting on a backend
+        # switch (the HF helper already returns None for all-ones masks,
+        # which is why only padded rows ever drifted).
         if attention_mask is not None and attention_mask.dim() == 2:
-            from transformers.modeling_attn_mask_utils import (
-                _prepare_4d_causal_attention_mask_for_sdpa,
-            )
+            right_padded = bool((attention_mask[:, :-1] >= attention_mask[:, 1:]).all())
+            if right_padded:
+                ext_mask = None
+            else:
+                from transformers.modeling_attn_mask_utils import (
+                    _prepare_4d_causal_attention_mask_for_sdpa,
+                )
 
-            ext_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                attention_mask,
-                input_shape=(bsz, seq_len),
-                inputs_embeds=hidden_states,
-                past_key_values_length=0,
-            )
+                ext_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                    attention_mask,
+                    input_shape=(bsz, seq_len),
+                    inputs_embeds=hidden_states,
+                    past_key_values_length=0,
+                )
         else:
             ext_mask = None
 

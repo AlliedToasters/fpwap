@@ -54,17 +54,25 @@ class GPT2Plumbing:
         # GPT-2's SDPA-path implementation expects a combined causal+padding 4D
         # mask (same thing GPT2Model.forward builds internally). Delegate to
         # HF's own prep helper so we match whichever attention impl is active.
+        # Right-padded inputs skip the mask entirely: under causal attention
+        # every pad key is in the future of every real query, so masking is
+        # redundant, and dropping it keeps SDPA on its fused causal path
+        # (real-token outputs match the unpadded forward bit-for-bit).
         if attention_mask is not None and attention_mask.dim() == 2:
-            from transformers.modeling_attn_mask_utils import (
-                _prepare_4d_causal_attention_mask_for_sdpa,
-            )
+            right_padded = bool((attention_mask[:, :-1] >= attention_mask[:, 1:]).all())
+            if right_padded:
+                attention_mask = None
+            else:
+                from transformers.modeling_attn_mask_utils import (
+                    _prepare_4d_causal_attention_mask_for_sdpa,
+                )
 
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                attention_mask,
-                input_shape=(hidden_states.shape[0], hidden_states.shape[1]),
-                inputs_embeds=hidden_states,
-                past_key_values_length=0,
-            )
+                attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                    attention_mask,
+                    input_shape=(hidden_states.shape[0], hidden_states.shape[1]),
+                    inputs_embeds=hidden_states,
+                    past_key_values_length=0,
+                )
 
         needs_decompose = bool({"attn_out", "mlp_out"} & wanted_hooks)
         if not needs_decompose:

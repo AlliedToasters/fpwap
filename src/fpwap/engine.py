@@ -675,6 +675,15 @@ def _trim_to_length(item: dict[str, Any], target_len: int, left_padded: bool) ->
     return result
 
 
+def _pad_rows(t: Tensor, target_len: int) -> Tensor:
+    """Zero-pad dim 1 (sequence) up to ``target_len`` (no-op when already there)."""
+    gap = target_len - t.shape[1]
+    if gap <= 0:
+        return t
+    z = torch.zeros((t.shape[0], gap, *t.shape[2:]), dtype=t.dtype, device=t.device)
+    return torch.cat([t, z], dim=1)
+
+
 def _build_bucketed_segments(
     items: list[Any],
     max_seq_len: int,
@@ -1509,11 +1518,36 @@ class Sweep:
 
                                 inline_dispatch = _inline
 
+                            # Right-padded microbatches run the forward at
+                            # their real max length. Pad rows are causally
+                            # inert, so trimming changes nothing semantically
+                            # — but it keeps kernel shapes identical to a
+                            # solo exact-length sweep, so with
+                            # microbatch_size=1 the real-token outputs are
+                            # bit-equal instead of drifting on
+                            # shape-dependent kernel selection (which MoE
+                            # routing amplifies into macroscopic per-token
+                            # divergence). Outputs are zero-padded back to
+                            # the bucket shape below; emit and buffer shapes
+                            # are unchanged.
+                            bucket_len = hidden_states.shape[1]
+                            fwd_len = bucket_len
+                            fwd_mask = mb_mask
+                            if mb_mask is not None:
+                                right_padded = bool(
+                                    (mb_mask[:, :-1] >= mb_mask[:, 1:]).all()
+                                )
+                                real_max = int(mb_mask.sum(dim=-1).max().item())
+                                if right_padded and 0 < real_max < bucket_len:
+                                    fwd_len = real_max
+                                    hidden_states = hidden_states[:, :real_max]
+                                    fwd_mask = mb_mask[:, :real_max]
+
                             hidden_states, extras = plumbing.layer_forward_with_hooks(
                                 model,
                                 block,
                                 hidden_states,
-                                attention_mask=mb_mask,
+                                attention_mask=fwd_mask,
                                 wanted_hooks=sub_hooks,
                                 dispatch_fn=inline_dispatch,
                             )
@@ -1521,6 +1555,12 @@ class Sweep:
 
                         if final_norm is not None and layer_idx == n_layers - 1:
                             hidden_states = final_norm(hidden_states)
+
+                        if fwd_len < bucket_len:
+                            hidden_states = _pad_rows(hidden_states, bucket_len)
+                            extras = {
+                                k: _pad_rows(v, bucket_len) for k, v in extras.items()
+                            }
 
                         t_cb = time.perf_counter_ns()
                         mb_emit_s = 0.0
