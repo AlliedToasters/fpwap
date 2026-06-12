@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
 import uuid
@@ -440,7 +441,17 @@ class _LayerStreamer:
 
     def load_layer(
         self, model: nn.Module, layer_idx: int, plumbing: ModelPlumbing
-    ) -> None:
+    ) -> Any | None:
+        """Load layer weights onto the execution device.
+
+        May return an opaque readiness handle (a CUDA event for async
+        staged loads); the caller must pass it to `wait_load_ready` before
+        computing with the layer. None means the load is already complete.
+        """
+        return None
+
+    def wait_load_ready(self, handle: Any | None) -> None:
+        """Order the current compute stream after an async staged load."""
         return None
 
     def unload_layer(
@@ -452,7 +463,8 @@ class _LayerStreamer:
         self, model: nn.Module, layer_idx: int, plumbing: ModelPlumbing
     ) -> Any | None:
         """Return a handle (future-like) that the engine can wait on, or
-        None if this streamer doesn't do prefetch."""
+        None if this streamer doesn't do prefetch. The future resolves to
+        the readiness handle for `wait_load_ready`."""
         return None
 
     def prefetch_chunk(
@@ -503,6 +515,21 @@ class _OffloadStreamer(_LayerStreamer):
         self._loader = loader
         self._accel_index = accel_index
         self.last_load_bytes = 0
+        # Pinned-staging fast path: read each layer's bytes straight from
+        # the shards into a pinned host buffer and issue one async H2D per
+        # layer, instead of per-param get_tensor + synchronous pageable
+        # copies. Kill switch: FPWAP_STAGED_LOAD=0 restores the legacy path.
+        from fpwap.loader import StagedLayerLoader
+
+        self._staged: StagedLayerLoader | None = None
+        if (
+            execution_device.type == "cuda"
+            and torch.cuda.is_available()
+            and os.environ.get("FPWAP_STAGED_LOAD", "1") != "0"
+        ):
+            self._staged = StagedLayerLoader(
+                loader, execution_device, accel_index=accel_index, plans=plans
+            )
         virtual_sources = {
             target: [key for key, _ in plan.sources]
             for target, plan in plans.items()
@@ -530,13 +557,24 @@ class _OffloadStreamer(_LayerStreamer):
 
     def load_layer(
         self, model: nn.Module, layer_idx: int, plumbing: ModelPlumbing
-    ) -> None:
-        _load_layer(model, layer_idx, plumbing, self._loader, self.execution_device)
+    ) -> Any | None:
+        handle: Any | None = None
+        if self._staged is not None:
+            handle = self._staged.load_layer(model, layer_idx, plumbing)
+        else:
+            _load_layer(
+                model, layer_idx, plumbing, self._loader, self.execution_device
+            )
         layer = plumbing.layer_modules(model)[layer_idx]
         bytes_loaded = 0
         for _, p in layer.named_parameters():
             bytes_loaded += p.element_size() * p.numel()
         self.last_load_bytes = bytes_loaded
+        return handle
+
+    def wait_load_ready(self, handle: Any | None) -> None:
+        if handle is not None:
+            torch.cuda.current_stream(self.execution_device).wait_event(handle)
 
     def unload_layer(
         self, model: nn.Module, layer_idx: int, plumbing: ModelPlumbing
@@ -565,9 +603,13 @@ class _OffloadStreamer(_LayerStreamer):
         if self._prefetch_pool is None:
             return None
 
-        def _load_all() -> None:
+        def _load_all() -> Any | None:
+            # The copy stream is sequential, so the last layer's readiness
+            # handle implies completion of every earlier staged copy.
+            handle: Any | None = None
             for li in layer_indices:
-                self.load_layer(model, li, plumbing)
+                handle = self.load_layer(model, li, plumbing)
+            return handle
 
         return self._prefetch_pool.submit(_load_all)
 
@@ -575,6 +617,8 @@ class _OffloadStreamer(_LayerStreamer):
         if self._prefetch_pool is not None:
             self._prefetch_pool.shutdown(wait=True)
             self._prefetch_pool = None
+        if self._staged is not None:
+            self._staged.close()
 
 
 def _make_chunks(n_layers: int, chunk_size: int) -> list[range]:
@@ -1440,13 +1484,17 @@ class Sweep:
                 is_last_in_chunk = layer_idx == chunk.stop - 1
                 has_scratch = bool(gpu_scratch)
 
-                # Load this layer (wait for prefetch, or sync load).
+                # Load this layer (wait for prefetch, or sync load). Staged
+                # loads return a readiness handle: the H2D copy may still be
+                # in flight on the copy stream, so order the compute stream
+                # behind it before any of this layer's kernels are enqueued.
                 t_load = time.perf_counter_ns()
                 if prefetch_future is not None:
-                    prefetch_future.result()
+                    load_handle = prefetch_future.result()
                     prefetch_future = None
                 else:
-                    streamer.load_layer(model, layer_idx, plumbing)
+                    load_handle = streamer.load_layer(model, layer_idx, plumbing)
+                streamer.wait_load_ready(load_handle)
                 timing.load_s = (time.perf_counter_ns() - t_load) / 1e9
                 timing.bytes_weights = streamer.last_load_bytes
 

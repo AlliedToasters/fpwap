@@ -422,6 +422,315 @@ def _load_named_param(
     )
 
 
+_STAGED_ALIGN = 64  # byte alignment for tensors packed into the staging buffer
+_STAGED_READ_THREADS = 8  # preadv workers; reads release the GIL
+
+
+@dataclass
+class _SourceRange:
+    """One contiguous byte range of checkpoint data backing (part of) a param."""
+
+    path: str
+    start: int
+    nbytes: int
+
+
+def _close_fds(fds: dict[str, int]) -> None:
+    for fd in fds.values():
+        os.close(fd)
+    fds.clear()
+
+
+class StagedLayerLoader:
+    """Pinned-staging layer loader: direct byte reads + one async H2D per layer.
+
+    The per-tensor path (`_load_layer`) is load-bound twice over: each
+    param goes through safetensors `get_tensor` (a fresh pageable CPU
+    tensor per call — and for transformers ≥5 fused-MoE params, through
+    the whole checkpoint-conversion machinery per layer), then through a
+    `set_module_tensor_to_device(..., non_blocking=True)` whose
+    `non_blocking` is silently synchronous from pageable memory. Measured
+    on a Qwen3-30B-A3B MoE layer: ~1 GB/s effective against a gen5 x16
+    link that does ~25× that from pinned memory, with the whole sweep
+    load-bound.
+
+    This loader cuts both costs:
+
+    - **Reads**: each param's bytes are `preadv`'d straight from the
+      safetensors shards into a reused pinned host buffer on a small
+      thread pool (the read releases the GIL; offsets come from the shard
+      headers). Fused params produced by checkpoint conversion are
+      assembled by concatenating their source ranges in plan order — and
+      the first time each param pattern is assembled, the result is
+      verified bitwise against the conversion machinery's output; a
+      pattern that doesn't match byte-concatenation permanently falls
+      back to the tensor path (`loader[name]` → copy into pinned), so the
+      fast path can never silently produce different weights.
+    - **Copies**: ONE genuinely-async H2D from the pinned buffer into a
+      fresh contiguous device buffer on a dedicated copy stream; params
+      install as views into that buffer.
+
+    Contract with the engine:
+
+    - `load_layer` returns a `torch.cuda.Event` recorded on the copy
+      stream after the H2D copy, or None when it fell back to the
+      per-tensor path. The caller must make its compute stream wait on the
+      event (`Sweep.run` does, via `streamer.wait_load_ready`) before
+      running the layer forward.
+    - Unloading is unchanged: `_unload_layer`'s meta re-install drops the
+      param views, freeing the device buffer back to the caching
+      allocator. The buffer is `record_stream`-marked against the copy
+      stream so the allocator won't recycle it under an in-flight copy.
+    - Install semantics mirror `set_module_tensor_to_device` for the
+      plain-Parameter meta→device case: checkpoint values are cast to the
+      meta param's dtype, shape mismatches raise, and a fresh
+      `nn.Parameter` replaces the placeholder. Layers with exotic param
+      subclasses (quantized wrappers etc.) fall back to `_load_layer`,
+      as does the whole loader if pinned allocation fails.
+
+    Loads are serialized by the engine (one outstanding prefetch), so a
+    single pinned buffer suffices: each fill waits host-side on the
+    previous layer's copy event before reusing the buffer.
+    """
+
+    def __init__(
+        self,
+        loader: Any,
+        device: torch.device,
+        accel_index: dict[str, dict[str, Any]] | None = None,
+        plans: dict[str, WeightConversionPlan] | None = None,
+    ) -> None:
+        self._loader = loader
+        self._device = device
+        self._accel_index = accel_index or {}
+        self._plans = plans or {}
+        self._copy_stream = torch.cuda.Stream(device=device)  # type: ignore[no-untyped-call]
+        self._pinned: torch.Tensor | None = None
+        self._pending: torch.cuda.Event | None = None
+        self._broken = False  # pinned alloc failed; permanent fallback
+        self._offsets: dict[str, dict[str, tuple[int, int]]] = {}
+        self._fds: dict[str, int] = {}
+        self._pool: Any | None = None
+        # Byte-assembly trust state, keyed by layer-relative param name
+        # (layers are structurally identical, so one verification covers
+        # the pattern across all layers).
+        self._verified: set[str] = set()
+        self._tensor_path: set[str] = set()
+        # Safety net: close shard fds on GC if close() is never reached
+        # (holds the dict, not self, so the finalizer doesn't pin the loader).
+        import weakref
+
+        weakref.finalize(self, _close_fds, self._fds)
+
+    def close(self) -> None:
+        # The last H2D may still be in flight on the copy stream; it reads
+        # from the pinned buffer this loader owns, so drain it before the
+        # buffer can be garbage-collected.
+        if self._pending is not None:
+            self._pending.synchronize()
+            self._pending = None
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+        _close_fds(self._fds)
+
+    def _range_of_key(self, key: str) -> _SourceRange | None:
+        entry = self._accel_index.get(key)
+        if entry is None:
+            return None
+        path = entry["safetensors_file"]
+        st_name = entry.get("weight_name", key)
+        if path not in self._offsets:
+            self._offsets[path] = _parse_safetensors_offsets(path)
+        rng = self._offsets[path].get(st_name)
+        if rng is None:
+            return None
+        start, end = rng
+        return _SourceRange(path, start, end - start)
+
+    def _ranges_for(self, full_name: str, param: nn.Parameter) -> list[_SourceRange] | None:
+        """Byte ranges whose concatenation should equal the param's bytes.
+
+        None when the param can't be byte-assembled (unknown key, dtype
+        mismatch vs the module, one-to-many conversion, size mismatch) —
+        callers then use the tensor path.
+        """
+        plan = self._plans.get(full_name)
+        if plan is not None:
+            if len(plan.targets) != 1:
+                return None  # one-to-many (qkv split etc.): not concatenation
+            keys = [k for k, _ in plan.sources]
+        else:
+            keys = [full_name]
+        ranges: list[_SourceRange] = []
+        module_dtype = str(param.dtype).removeprefix("torch.")
+        for key in keys:
+            entry = self._accel_index.get(key)
+            if entry is None or str(entry.get("dtype", "")) != module_dtype:
+                return None
+            rng = self._range_of_key(key)
+            if rng is None:
+                return None
+            ranges.append(rng)
+        if sum(r.nbytes for r in ranges) != param.element_size() * param.numel():
+            return None
+        return ranges
+
+    def _fd(self, path: str) -> int:
+        fd = self._fds.get(path)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
+            self._fds[path] = fd
+        return fd
+
+    def load_layer(
+        self, model: nn.Module, layer_idx: int, plumbing: Any
+    ) -> torch.cuda.Event | None:
+        layer = plumbing.layer_modules(model)[layer_idx]
+        prefix = plumbing.layer_prefix(layer_idx)
+
+        # Pack plan: (rel_name, meta_param, byte_offset, nbytes).
+        entries: list[tuple[str, nn.Parameter, int, int]] = []
+        total = 0
+        fallback = self._broken
+        for rel_name, param in layer.named_parameters():
+            if type(param) is not nn.Parameter:
+                fallback = True
+                break
+            offset = -(-total // _STAGED_ALIGN) * _STAGED_ALIGN
+            nbytes = param.element_size() * param.numel()
+            entries.append((rel_name, param, offset, nbytes))
+            total = offset + nbytes
+        if fallback:
+            _load_layer(model, layer_idx, plumbing, self._loader, self._device)
+            return None
+
+        # Host fill: wait for the previous layer's H2D to release the pinned
+        # buffer, then pack every tensor back-to-back at the param's dtype.
+        if self._pending is not None:
+            self._pending.synchronize()
+            self._pending = None
+        if self._pinned is None or self._pinned.numel() < total:
+            self._pinned = None
+            try:
+                self._pinned = torch.empty(
+                    total, dtype=torch.uint8, pin_memory=True
+                )
+            except RuntimeError:
+                self._broken = True
+                _load_layer(model, layer_idx, plumbing, self._loader, self._device)
+                return None
+        self._fill_pinned(entries, prefix)
+
+        assert self._pinned is not None
+        # One async H2D into a fresh device buffer on the copy stream. The
+        # buffer's home stream is this thread's current (compute) stream, so
+        # post-unload reuse by compute-stream allocations is ordered; the
+        # record_stream covers the cross-stream write.
+        dev = torch.empty(total, dtype=torch.uint8, device=self._device)
+        event = torch.cuda.Event()  # type: ignore[no-untyped-call]
+        with torch.cuda.stream(self._copy_stream):
+            dev.copy_(self._pinned[:total], non_blocking=True)
+            event.record(self._copy_stream)
+        dev.record_stream(self._copy_stream)
+
+        # Install params as views into the device buffer (the meta→real
+        # transition only needs a fresh Parameter in module._parameters,
+        # exactly what set_module_tensor_to_device does underneath).
+        for rel_name, param, offset, nbytes in entries:
+            view = dev[offset : offset + nbytes].view(param.dtype).view(param.shape)
+            submod_path, _, leaf = rel_name.rpartition(".")
+            submod = layer.get_submodule(submod_path) if submod_path else layer
+            submod._parameters[leaf] = nn.Parameter(
+                view, requires_grad=param.requires_grad
+            )
+        self._pending = event
+        return event
+
+    def _fill_pinned(
+        self, entries: list[tuple[str, nn.Parameter, int, int]], prefix: str
+    ) -> None:
+        """Pack every param's bytes into the pinned buffer.
+
+        Byte-assemblable params are read with preadv on a thread pool;
+        the rest go through `loader[name]` (conversion machinery / dtype
+        cast) on this thread while the pool drains. First-time byte
+        assemblies are verified bitwise against the tensor path before
+        the pattern is trusted.
+        """
+        import concurrent.futures as _cf
+
+        assert self._pinned is not None
+        pinned_mv = memoryview(self._pinned.numpy())  # type: ignore[arg-type]
+
+        byte_jobs: list[tuple[str, nn.Parameter, int, int, list[_SourceRange]]] = []
+        tensor_jobs: list[tuple[str, nn.Parameter, int, int]] = []
+        for rel_name, param, offset, nbytes in entries:
+            ranges = (
+                None
+                if rel_name in self._tensor_path
+                else self._ranges_for(f"{prefix}.{rel_name}", param)
+            )
+            if ranges is None:
+                tensor_jobs.append((rel_name, param, offset, nbytes))
+            else:
+                byte_jobs.append((rel_name, param, offset, nbytes, ranges))
+
+        futures: list[Any] = []
+        if byte_jobs:
+            if self._pool is None:
+                self._pool = _cf.ThreadPoolExecutor(
+                    max_workers=_STAGED_READ_THREADS,
+                    thread_name_prefix="fpwap-staged-read",
+                )
+
+            def _read(path: str, start: int, dst_lo: int, dst_hi: int) -> None:
+                os.preadv(self._fd(path), [pinned_mv[dst_lo:dst_hi]], start)
+
+            for _, _, offset, _, ranges in byte_jobs:
+                dst = offset
+                for rng in ranges:
+                    futures.append(
+                        self._pool.submit(_read, rng.path, rng.start, dst, dst + rng.nbytes)
+                    )
+                    dst += rng.nbytes
+
+        for rel_name, param, offset, nbytes in tensor_jobs:
+            value = self._loader[f"{prefix}.{rel_name}"]
+            if value.shape != param.shape:
+                raise ValueError(
+                    f"checkpoint tensor {prefix}.{rel_name} has shape "
+                    f"{tuple(value.shape)}, module expects {tuple(param.shape)}"
+                )
+            staged = self._pinned[offset : offset + nbytes]
+            staged.view(param.dtype).view(param.shape).copy_(value)
+
+        for fut in futures:
+            fut.result()
+
+        # First use of each pattern: prove byte concatenation reproduces the
+        # conversion machinery's output before trusting it for later layers.
+        for rel_name, param, offset, nbytes, _ in byte_jobs:
+            if rel_name in self._verified:
+                continue
+            staged = self._pinned[offset : offset + nbytes]
+            view = staged.view(param.dtype).view(param.shape)
+            reference = self._loader[f"{prefix}.{rel_name}"]
+            if reference.shape == param.shape and torch.equal(
+                view, reference.to(param.dtype)
+            ):
+                self._verified.add(rel_name)
+            else:
+                self._tensor_path.add(rel_name)
+                if reference.shape != param.shape:
+                    raise ValueError(
+                        f"checkpoint tensor {prefix}.{rel_name} has shape "
+                        f"{tuple(reference.shape)}, module expects "
+                        f"{tuple(param.shape)}"
+                    )
+                view.copy_(reference)
+
+
 def _unload_layer(model: nn.Module, layer_idx: int, plumbing: Any) -> None:
     """Release layer `layer_idx` weights back to the meta device.
 
