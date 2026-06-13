@@ -222,6 +222,7 @@ class TestAdvisorVirtualSources:
         """fadvise on a fused module param name must hit the underlying
         per-expert checkpoint ranges, or MoE sweeps silently lose page-cache
         discipline (the #61/#69 regime)."""
+        import os
         from unittest.mock import patch
 
         from fpwap.loader import ShardPageAdvisor
@@ -233,10 +234,13 @@ class TestAdvisorVirtualSources:
         sources = [
             f"model.layers.0.mlp.experts.{e}.down_proj.weight" for e in range(4)
         ]
-        advisor = ShardPageAdvisor(
-            accel_index,
-            virtual_sources={"model.layers.0.mlp.experts.down_proj": sources},
-        )
+        # Disable resident caching so this exercises virtual-source range
+        # expansion through an eager DONTNEED, not the budget path.
+        with patch.dict(os.environ, {"FPWAP_PAGE_RESIDENT": "0"}):
+            advisor = ShardPageAdvisor(
+                accel_index,
+                virtual_sources={"model.layers.0.mlp.experts.down_proj": sources},
+            )
 
         with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
             advisor.advise_dontneed(["model.layers.0.mlp.experts.down_proj"])

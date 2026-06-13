@@ -8,7 +8,12 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
-from fpwap.loader import ShardPageAdvisor, _parse_safetensors_offsets
+from fpwap.loader import (
+    ShardPageAdvisor,
+    _parse_safetensors_offsets,
+    _phys_ram_bytes,
+    _resident_page_budget,
+)
 
 
 def _make_shard(tmp_path: Path, name: str = "model.safetensors") -> Path:
@@ -90,7 +95,10 @@ class TestShardPageAdvisor:
     def test_advise_dontneed_calls_posix_fadvise(self, tmp_path: Path) -> None:
         shard_path = _make_shard(tmp_path)
         index = _make_accel_index(shard_path)
-        advisor = ShardPageAdvisor(index)
+        # Disable resident caching so DONTNEED is issued eagerly (the regime
+        # this test exercises); residency is covered in TestResidentPageCache.
+        with patch.dict(os.environ, {"FPWAP_PAGE_RESIDENT": "0"}):
+            advisor = ShardPageAdvisor(index)
 
         with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
             advisor.advise_dontneed([
@@ -139,7 +147,8 @@ class TestShardPageAdvisor:
     def test_oserror_is_silenced(self, tmp_path: Path) -> None:
         shard_path = _make_shard(tmp_path)
         index = _make_accel_index(shard_path)
-        advisor = ShardPageAdvisor(index)
+        with patch.dict(os.environ, {"FPWAP_PAGE_RESIDENT": "0"}):
+            advisor = ShardPageAdvisor(index)
 
         with patch(
             "fpwap.loader.os.posix_fadvise",
@@ -174,7 +183,8 @@ class TestShardPageAdvisor:
                 "shape": [4, 4],
             },
         }
-        advisor = ShardPageAdvisor(index)
+        with patch.dict(os.environ, {"FPWAP_PAGE_RESIDENT": "0"}):
+            advisor = ShardPageAdvisor(index)
 
         fds_opened: list[str] = []
         original_open = os.open
@@ -188,3 +198,82 @@ class TestShardPageAdvisor:
                 advisor.advise_dontneed(["w0", "w1"])
 
         assert len(fds_opened) == 2
+
+
+class TestResidentPageBudget:
+    def test_default_budget_is_ram_fraction(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FPWAP_PAGE_RESIDENT", None)
+            os.environ.pop("FPWAP_PAGE_RESIDENT_GB", None)
+            budget = _resident_page_budget()
+        assert budget == int(0.6 * _phys_ram_bytes())
+
+    def test_env_disable_returns_zero(self) -> None:
+        with patch.dict(os.environ, {"FPWAP_PAGE_RESIDENT": "0"}):
+            assert _resident_page_budget() == 0
+
+    def test_env_gb_override(self) -> None:
+        with patch.dict(os.environ, {"FPWAP_PAGE_RESIDENT_GB": "2"}):
+            os.environ.pop("FPWAP_PAGE_RESIDENT", None)
+            assert _resident_page_budget() == 2_000_000_000
+
+    def test_env_disable_wins_over_gb(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"FPWAP_PAGE_RESIDENT": "0", "FPWAP_PAGE_RESIDENT_GB": "8"},
+        ):
+            assert _resident_page_budget() == 0
+
+
+class TestResidentPageCache:
+    def test_within_budget_suppresses_dontneed(self, tmp_path: Path) -> None:
+        index = _make_accel_index(_make_shard(tmp_path))
+        advisor = ShardPageAdvisor(index)
+        advisor._budget = 10_000  # bytes — far exceeds the tiny shard
+
+        with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
+            advisor.advise_dontneed(["model.layers.0.self_attn.q_proj.weight"])
+            mock_fadvise.assert_not_called()
+
+        # 4×8 bf16 = 64 bytes held resident.
+        assert advisor._resident_bytes == 4 * 8 * 2
+
+    def test_resident_layer_revisit_counts_once(self, tmp_path: Path) -> None:
+        # A layer re-unloaded on the next sweep stays resident without being
+        # re-counted or evicted — the cross-shard reuse this feature exists for.
+        index = _make_accel_index(_make_shard(tmp_path))
+        advisor = ShardPageAdvisor(index)
+        advisor._budget = 10_000
+        names = ["model.layers.0.self_attn.q_proj.weight"]
+
+        with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
+            advisor.advise_dontneed(names)
+            advisor.advise_dontneed(names)
+            mock_fadvise.assert_not_called()
+
+        assert advisor._resident_bytes == 4 * 8 * 2
+
+    def test_evicts_once_over_budget(self, tmp_path: Path) -> None:
+        # Keep-prefix: the 64-byte layer0 fits and stays resident; the 128-byte
+        # layer1 pushes over budget and is DONTNEED'd.
+        index = _make_accel_index(_make_shard(tmp_path))
+        advisor = ShardPageAdvisor(index)
+        advisor._budget = 4 * 8 * 2  # exactly layer0's size
+
+        with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
+            advisor.advise_dontneed(["model.layers.0.self_attn.q_proj.weight"])
+            assert mock_fadvise.call_count == 0
+            advisor.advise_dontneed(["model.layers.1.self_attn.q_proj.weight"])
+            assert mock_fadvise.call_count == 1
+
+        assert advisor._resident_bytes == 4 * 8 * 2
+
+    def test_disabled_budget_always_evicts(self, tmp_path: Path) -> None:
+        index = _make_accel_index(_make_shard(tmp_path))
+        with patch.dict(os.environ, {"FPWAP_PAGE_RESIDENT": "0"}):
+            advisor = ShardPageAdvisor(index)
+        assert advisor._budget == 0
+
+        with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
+            advisor.advise_dontneed(["model.layers.0.self_attn.q_proj.weight"])
+            assert mock_fadvise.call_count == 1
