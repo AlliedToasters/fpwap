@@ -895,6 +895,15 @@ class ShardPageAdvisor:
         # Hold touched layers resident in the page cache up to the budget so
         # repeated / multi-shard sweeps reuse warm pages instead of re-reading
         # from disk; only evict once the resident set would exceed the budget.
+        #
+        # Eviction is keep-prefix, not LRU: the first layers seen fill the
+        # budget and stay resident for the run; layers encountered after it
+        # fills are DONTNEED'd on every sweep. This is deliberate — lens-style
+        # workloads sweep the *same* layer set over N shards, a cyclic access
+        # pattern on which LRU is pessimal (Belady) while keep-prefix retains
+        # the largest cacheable contiguous prefix. A full-depth sweep larger
+        # than the budget thus stays bounded; a truncated/repeated sweep that
+        # fits runs fully warm.
         if self._budget:
             key = frozenset(weight_names)
             if key in self._resident_keys:
