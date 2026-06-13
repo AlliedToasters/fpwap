@@ -17,6 +17,49 @@ from torch import nn
 _HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 
 
+def _phys_ram_bytes() -> int:
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def _resident_page_budget() -> int:
+    """Byte budget for weight pages held resident in the page cache.
+
+    ``DONTNEED``-after-unload frees a layer's pages so the kernel can reclaim
+    them for the next layer. That is necessary when the *touched* weight set
+    exceeds host RAM, but actively harmful when it fits: it forces every sweep
+    to re-read the shards from disk instead of reusing the warm page cache, so
+    a workload that streams many shards (each a full layer sweep) runs
+    disk-bound at the snapshot's read rate.
+
+    The advisor keeps touched layers resident up to this budget and only
+    DONTNEEDs beyond it (see ``ShardPageAdvisor.advise_dontneed``). Truncated
+    sweeps (an activations-only profile stops at the deepest probed layer) and
+    repeated reads then run compute-bound; a full-depth sweep larger than the
+    budget fills it and evicts the rest gracefully. The budget is a fraction
+    of total RAM rather than the whole snapshot, so the policy is correct even
+    when the full snapshot is larger than RAM but the swept prefix is not.
+
+    ``0`` disables resident caching (restores the always-DONTNEED behavior).
+    Override the whole policy with ``FPWAP_PAGE_RESIDENT=0`` (off) or set the
+    budget directly with ``FPWAP_PAGE_RESIDENT_GB=<n>``.
+    """
+    if os.environ.get("FPWAP_PAGE_RESIDENT") in ("0", "false", "False"):
+        return 0
+    gb = os.environ.get("FPWAP_PAGE_RESIDENT_GB")
+    if gb is not None:
+        try:
+            return int(float(gb) * 1e9)
+        except ValueError:
+            pass
+    ram = _phys_ram_bytes()
+    # Leave ~40% of RAM for activation/emit buffers, pinned staging buffers,
+    # other processes, and the kernel's own reclaim headroom.
+    return int(0.6 * ram) if ram > 0 else 0
+
+
 def resolve_snapshot_dir(model: str) -> Path:
     """Resolve `model` to a local HF snapshot directory.
 
@@ -770,8 +813,12 @@ def _parse_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
 class ShardPageAdvisor:
     """Advises the kernel about page cache for safetensors shards.
 
-    Uses posix_fadvise(DONTNEED) after a layer is unloaded so the kernel
-    can reclaim those pages for upcoming layers. On non-Linux platforms
+    Uses posix_fadvise(DONTNEED) after a layer is unloaded so the kernel can
+    reclaim those pages for upcoming layers — but only once the resident
+    weight set exceeds the page budget (see ``_resident_page_budget``). Touched
+    layers within the budget are kept resident so the page cache stays warm
+    across sweeps and repeated / truncated multi-shard reads run compute-bound
+    rather than re-reading shards from disk each sweep. On non-Linux platforms
     (no posix_fadvise), all methods are silent no-ops.
 
     `virtual_sources` maps module param names that don't exist on disk
@@ -787,7 +834,11 @@ class ShardPageAdvisor:
     ) -> None:
         self._offsets: dict[str, tuple[str, int, int]] = {}
         self._virtual_sources = virtual_sources or {}
+        self._budget = _resident_page_budget()
+        self._resident_keys: set[frozenset[str]] = set()
+        self._resident_bytes = 0
         if not _HAS_POSIX_FADVISE:
+            self._budget = 0
             return
 
         shard_paths: set[str] = set()
@@ -804,6 +855,17 @@ class ShardPageAdvisor:
             if st_name in shard_offsets.get(shard_path, {}):
                 start, end = shard_offsets[shard_path][st_name]
                 self._offsets[weight_name] = (shard_path, start, end)
+
+    def _bytes_for(self, weight_names: list[str]) -> int:
+        expanded: list[str] = []
+        for name in weight_names:
+            expanded.extend(self._virtual_sources.get(name, (name,)))
+        return sum(
+            end - start
+            for name in expanded
+            if name in self._offsets
+            for _, start, end in (self._offsets[name],)
+        )
 
     def _advise(self, weight_names: list[str], advice: int) -> None:
         if not _HAS_POSIX_FADVISE:
@@ -830,6 +892,18 @@ class ShardPageAdvisor:
                 pass
 
     def advise_dontneed(self, weight_names: list[str]) -> None:
+        # Hold touched layers resident in the page cache up to the budget so
+        # repeated / multi-shard sweeps reuse warm pages instead of re-reading
+        # from disk; only evict once the resident set would exceed the budget.
+        if self._budget:
+            key = frozenset(weight_names)
+            if key in self._resident_keys:
+                return
+            layer_bytes = self._bytes_for(weight_names)
+            if self._resident_bytes + layer_bytes <= self._budget:
+                self._resident_keys.add(key)
+                self._resident_bytes += layer_bytes
+                return
         self._advise(weight_names, os.POSIX_FADV_DONTNEED)
 
     def advise_willneed(self, weight_names: list[str]) -> None:
