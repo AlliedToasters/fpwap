@@ -621,12 +621,19 @@ class _OffloadStreamer(_LayerStreamer):
             self._staged.close()
 
 
-def _make_chunks(n_layers: int, chunk_size: int) -> list[range]:
-    """Partition [0, n_layers) into consecutive chunks of at most chunk_size."""
+def _make_chunks(n_layers: int, chunk_size: int, start_layer: int = 0) -> list[range]:
+    """Partition [start_layer, n_layers) into consecutive chunks of at most chunk_size.
+
+    ``start_layer`` is the seek lower bound: a resume from a stored residual
+    runs only blocks ``[start_layer, n_layers)``, the symmetric dual of the
+    ``:N`` capture-depth upper bound (``effective_n_layers``). Defaults to 0
+    (a cold pass from the embedding)."""
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    if start_layer < 0:
+        raise ValueError(f"start_layer must be >= 0, got {start_layer}")
     chunks: list[range] = []
-    for start in range(0, n_layers, chunk_size):
+    for start in range(start_layer, n_layers, chunk_size):
         end = min(start + chunk_size, n_layers)
         chunks.append(range(start, end))
     return chunks
@@ -661,6 +668,30 @@ def _stack_field(items: list[Any], key: str) -> Tensor:
             t = t.unsqueeze(0)
         parts.append(t)
     return torch.cat(parts, dim=0)
+
+
+def _stack_seed_residuals(items: list[Any]) -> Tensor:
+    """Collate per-item seed residuals `[seq, hidden]` into `(mb, seq, hidden)`."""
+    return torch.stack([item["residual"] for item in items], dim=0)
+
+
+def _validate_seed_items(items: list[Any], seq_len: int, hidden: int) -> None:
+    """A resume seeds the residual buffer instead of embedding; every item must
+    carry a full-sequence `residual` `[seq_len, hidden]` (the input to block
+    `start_layer`). A partial-position residual is not resumable — block
+    `start_layer` attends over the whole prefix."""
+    for i, item in enumerate(items):
+        res = item.get("residual")
+        if res is None:
+            raise ValueError(
+                "start_layer > 0 seeds the residual buffer, so every dataset item "
+                f"needs a 'residual' tensor; item {i} has none"
+            )
+        if res.dim() != 2 or res.shape[0] != seq_len or res.shape[1] != hidden:
+            raise ValueError(
+                f"seed residual for item {i} must have shape "
+                f"(seq_len={seq_len}, hidden={hidden}); got {tuple(res.shape)}"
+            )
 
 
 @dataclass
@@ -918,6 +949,18 @@ class Sweep:
     """The engine. Inverts the inference loop: for each layer, run the dataset.
 
     Construction is cheap; call .preflight() to plan, .run() to execute.
+
+    Seek window ``[start_layer, N]``. ``N`` (the capture-depth upper bound)
+    already falls out of the callbacks: the loop stops at the deepest layer any
+    callback targets and skips the embedding-to-there and the final norm + head.
+    ``start_layer`` is the symmetric lower bound — seed the residual buffer with
+    a stored residual (one ``"residual"`` tensor ``[seq_len, hidden]`` per
+    dataset item, the input to block ``start_layer``) and run only blocks
+    ``[start_layer, N)``. With ``start_layer == 0`` (the default) the buffer is
+    seeded by the embedding pass as usual. Re-running a sub-range of blocks over
+    a bit-identical seed reproduces the cold pass bitwise, so a resume is exact,
+    not approximate — the seed's dtype is the only thing that can perturb it, and
+    that is the caller's to guarantee. Seed mode requires ``padding="fixed"``.
     """
 
     def __init__(
@@ -941,8 +984,11 @@ class Sweep:
         apply_final_norm: bool = True,
         padding: PaddingMode = "fixed",
         chunk_size: int = 1,
+        start_layer: int = 0,
         _accel_index: dict[str, dict[str, Any]] | None = None,
     ) -> None:
+        if start_layer < 0:
+            raise ValueError(f"start_layer must be >= 0, got {start_layer}")
         self.model = model
         self.dataset = dataset
         self.seq_len = seq_len
@@ -959,6 +1005,7 @@ class Sweep:
         self.apply_final_norm = apply_final_norm
         self.padding: PaddingMode = padding
         self.chunk_size = chunk_size
+        self.start_layer = start_layer
         self._accel_index = _accel_index
         self.execution_device = (
             torch.device(execution_device) if execution_device is not None else None
@@ -1265,6 +1312,15 @@ class Sweep:
                 "model.config.hidden_size is required to size the residual buffer"
             )
         hidden = int(hidden_attr)
+        seeding = self.start_layer > 0
+        if seeding:
+            if self.padding != "fixed":
+                raise NotImplementedError(
+                    "start_layer > 0 (resume from residual) requires padding='fixed'. "
+                    "A resume runs a single start_layer per sweep; batch units that "
+                    "share a seed depth and pad them to a common seq_len."
+                )
+            _validate_seed_items(items, self.seq_len, hidden)
         pl.resolve_dataset_s = (time.perf_counter_ns() - t0) / 1e9
 
         _emit_progress("preloop_ensure_embedding", -1, 0, 0)
@@ -1272,7 +1328,11 @@ class Sweep:
             sys.stderr.write("fpwap: loading embedding weights...\n")
             sys.stderr.flush()
         t0 = time.perf_counter_ns()
-        streamer.ensure_embedding_loaded(model, plumbing)
+        # A resume seeds the buffer from a stored residual, so the embedding
+        # is never read — skip its load (the whole point is to not pay for
+        # the layers below start_layer).
+        if self.start_layer == 0:
+            streamer.ensure_embedding_loaded(model, plumbing)
         final_norm: nn.Module | None = None
         if self.apply_final_norm:
             final_norm = plumbing.final_norm_module(model)
@@ -1386,17 +1446,26 @@ class Sweep:
             sys.stderr.flush()
         t0_embed = time.perf_counter_ns()
 
-        # Pass 0: embedding over the whole dataset. Contiguous write_slice
-        # into the pinned CPU buffer goes through the CUDA copy engine.
+        # Pass 0: seed the residual buffer over the whole dataset. Cold, that
+        # is the embedding; a resume writes the stored residual (the input to
+        # block start_layer) instead — same buffer, same shape, just a deeper
+        # starting point. Contiguous write_slice into the pinned CPU buffer
+        # goes through the CUDA copy engine.
         with torch.no_grad():
             for seg in segments:
                 for start in range(0, seg.n_samples, seg.mb_size):
                     stop = min(start + seg.mb_size, seg.n_samples)
-                    input_ids = _stack_field(
-                        seg.items[start:stop], "input_ids"
-                    ).to(exec_device)
-                    embedded = plumbing.embed(model, input_ids)
-                    seg.buffer.write_slice(start, stop, embedded)
+                    if seeding:
+                        seeded = _stack_seed_residuals(seg.items[start:stop]).to(
+                            exec_device, dtype=self.transport_dtype
+                        )
+                        seg.buffer.write_slice(start, stop, seeded)
+                    else:
+                        input_ids = _stack_field(
+                            seg.items[start:stop], "input_ids"
+                        ).to(exec_device)
+                        embedded = plumbing.embed(model, input_ids)
+                        seg.buffer.write_slice(start, stop, embedded)
                     if seg.mask_buffer is not None:
                         seg.mask_buffer[start:stop] = _stack_field(
                             seg.items[start:stop], "attention_mask"
@@ -1431,6 +1500,13 @@ class Sweep:
         max_cap = _max_capture_layer(self.callbacks, n_layers)
         effective_n_layers = min(max_cap + 1, n_layers)
 
+        if seeding and self.start_layer >= effective_n_layers:
+            raise ValueError(
+                f"start_layer={self.start_layer} is at or past the deepest "
+                f"captured layer ({effective_n_layers - 1}); no block would run. "
+                "Resume from a layer below the ones you want to read."
+            )
+
         if final_norm is not None and effective_n_layers < n_layers:
             final_norm = None
 
@@ -1444,7 +1520,7 @@ class Sweep:
 
         loop_setup_s = (time.perf_counter_ns() - t0_loop_setup) / 1e9
 
-        chunks = _make_chunks(effective_n_layers, self.chunk_size)
+        chunks = _make_chunks(effective_n_layers, self.chunk_size, self.start_layer)
 
         # When chunk_size > 1 and the buffer lives on a different device
         # from the execution device, we allocate a GPU-resident scratch

@@ -61,3 +61,33 @@ def test_invalid_chunk_size_zero() -> None:
 def test_invalid_chunk_size_negative() -> None:
     with pytest.raises(ValueError):
         _make_chunks(5, -1)
+
+
+def test_start_layer_offsets_the_window() -> None:
+    # Resume from block 2: only [2, 8) runs.
+    assert _make_chunks(8, 4, 2) == [range(2, 6), range(6, 8)]
+
+
+def test_start_layer_chunk_size_1() -> None:
+    assert _make_chunks(5, 1, 3) == [range(3, 4), range(4, 5)]
+
+
+def test_start_layer_at_last_layer() -> None:
+    # Seed at the deepest layer: a single block runs.
+    assert _make_chunks(4, 4, 3) == [range(3, 4)]
+
+
+def test_start_layer_covers_window_exactly() -> None:
+    for n in [4, 10, 32, 80]:
+        for start in [0, 1, n // 2, n - 1]:
+            for cs in [1, 3, 16, 100]:
+                chunks = _make_chunks(n, cs, start)
+                covered: list[int] = []
+                for c in chunks:
+                    covered.extend(c)
+                assert covered == list(range(start, n)), f"n={n}, cs={cs}, start={start}"
+
+
+def test_invalid_start_layer_negative() -> None:
+    with pytest.raises(ValueError):
+        _make_chunks(5, 1, -1)
