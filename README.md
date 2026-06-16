@@ -253,9 +253,9 @@ affects downstream compute), all four reference callbacks shipped
 `result.activations(...)`, tqdm progress plus callable `progress=reporter`
 emitting `ProgressEvent`s for wandb/rich sinks, pinned-CPU
 `buffer_device="cpu"` with async D2H copy (so oversized residual buffers
-don't block compute), worker-thread **concurrent weight prefetch** on the
-streaming path (layer L+1's safetensors read + H2D overlap with layer L's
-compute), `MemmapBackend` for disk-backed emits,
+don't block compute), opt-in worker-thread **concurrent weight prefetch** on
+the streaming path (`FPWAP_PREFETCH_LOAD=1`, layer L+1's safetensors read +
+H2D overlap with layer L's compute), `MemmapBackend` for disk-backed emits,
 `ProfileReport.throughput_tok_per_s()` / `weight_bandwidth_gb_per_s()`,
 `verify=True` fail-fast against a naive-forward baseline (pre-loaded
 models), per-layer `on_layer_end` artifacts collected into
