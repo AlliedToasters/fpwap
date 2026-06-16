@@ -314,3 +314,188 @@ def test_seed_requires_residual(snapshot: Path) -> None:
     )
     with pytest.raises(ValueError, match="residual"):
         sweep.run()
+
+
+# --- Batched resume: a variable-length batch under padding="bucketed" runs
+#     each unit at its own real length and reproduces the per-unit solo resume
+#     bitwise. This is the lens keyframe-cache batching path: units sharing a
+#     start_layer ride one sweep instead of one sweep each. Needs a wider
+#     position table than the 7-token base snapshot so buckets can differ.
+
+BUCKET_NPOS = 64
+BUCKET_LENGTHS = [40, 12, 9, 33]  # → buckets {40 (capped), 16, 16, 40}: two segments
+
+
+def _write_bucket_snapshot(snapshot_dir: Path) -> None:
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    config = GPT2Config(
+        vocab_size=VOCAB,
+        n_positions=BUCKET_NPOS,
+        n_embd=HIDDEN,
+        n_layer=N_LAYERS,
+        n_head=N_HEAD,
+    )
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    config.save_pretrained(snapshot_dir)
+
+    torch.manual_seed(SEED + 7)
+    src = GPT2LMHeadModel(config)
+    src.eval()
+    state_dict = {
+        k: v.contiguous() for k, v in src.state_dict().items() if k != "lm_head.weight"
+    }
+    save_file(state_dict, snapshot_dir / "model.safetensors")
+    (snapshot_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": {k: "model.safetensors" for k in state_dict},
+            }
+        )
+    )
+
+
+@pytest.fixture(scope="module")
+def bucket_snapshot(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    d = tmp_path_factory.mktemp("tiny_gpt2_bucket") / "snapshot"
+    _write_bucket_snapshot(d)
+    return d
+
+
+def _solo_cold(
+    snapshot_dir: Path,
+    ids: torch.Tensor,
+    *,
+    compute_dtype: torch.dtype,
+    store_dtype: torch.dtype,
+) -> dict[int, torch.Tensor]:
+    """One unit's cold fixed sweep at its own length — the keyframe-cache 'miss'
+    a batched resume must reproduce, and the source of its seed residual."""
+    from fpwap import Sweep
+    from fpwap.callbacks.common import RawActivations
+
+    sweep = Sweep(
+        model=str(snapshot_dir),
+        dataset=[{"input_ids": ids}],
+        seq_len=int(ids.shape[-1]),
+        callbacks=[
+            RawActivations(
+                layers="all",
+                hook="residual_post",
+                last_token_only=False,
+                out_dtype=store_dtype,
+            )
+        ],
+        transport_dtype=compute_dtype,
+        execution_device="cpu",
+        microbatch_size=1,
+        progress=False,
+    )
+    result = sweep.run()
+    return {
+        layer: result.activations(layer=layer, hook="residual_post")[0]
+        for layer in range(N_LAYERS)
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compute_dtype,store_dtype", MATCHED_DTYPES)
+@pytest.mark.parametrize("start_layer", [1, 2, 3])
+def test_bucketed_resume_matches_solo(
+    bucket_snapshot: Path,
+    start_layer: int,
+    compute_dtype: torch.dtype,
+    store_dtype: torch.dtype,
+) -> None:
+    """A single bucketed resume sweep over a variable-length batch reproduces
+    each unit's solo per-unit resume bitwise. Units of differing length share
+    one ``start_layer``; the in-loop right-pad trim (microbatch 1) runs each at
+    its real length, so batching is free of numerical cost — the property that
+    lets the keyframe cache batch same-start_layer units without breaking the
+    hit==miss bit-exactness guarantee."""
+    torch.manual_seed(SEED + 8)
+    ids = [torch.randint(0, VOCAB, (1, length)) for length in BUCKET_LENGTHS]
+
+    solo = [
+        _solo_cold(bucket_snapshot, x, compute_dtype=compute_dtype, store_dtype=store_dtype)
+        for x in ids
+    ]
+    # The input to block start_layer is residual_post of block start_layer - 1,
+    # at each unit's own real length.
+    seeds = [s[start_layer - 1] for s in solo]
+
+    max_len = max(BUCKET_LENGTHS)
+    dataset = []
+    for x, seed, length in zip(ids, seeds, BUCKET_LENGTHS, strict=True):
+        padded = torch.zeros(1, max_len, dtype=torch.long)
+        padded[0, :length] = x[0]
+        mask = torch.zeros(1, max_len, dtype=torch.long)
+        mask[0, :length] = 1
+        dataset.append({"input_ids": padded, "attention_mask": mask, "residual": seed})
+
+    from fpwap import Sweep
+    from fpwap.callbacks.common import RawActivations
+
+    sweep = Sweep(
+        model=str(bucket_snapshot),
+        dataset=dataset,
+        seq_len=max_len,
+        padding="bucketed",
+        callbacks=[
+            RawActivations(
+                layers=list(range(start_layer, N_LAYERS)),
+                hook="residual_post",
+                last_token_only=False,
+                out_dtype=store_dtype,
+            )
+        ],
+        transport_dtype=compute_dtype,
+        execution_device="cpu",
+        microbatch_size=1,
+        start_layer=start_layer,
+        progress=False,
+    )
+    result = sweep.run()
+
+    for i, length in enumerate(BUCKET_LENGTHS):
+        for layer in range(start_layer, N_LAYERS):
+            got = result.activations(layer=layer, hook="residual_post")[i, :length]
+            exp = solo[i][layer]
+            max_abs = (got.float() - exp.float()).abs().max().item()
+            assert torch.equal(got, exp), (
+                f"bucketed resume from {start_layer}: unit {i} (len {length}) "
+                f"layer {layer} diverged from solo (max_abs={max_abs})"
+            )
+
+
+@pytest.mark.integration
+def test_bucketed_resume_validates_seed_length(bucket_snapshot: Path) -> None:
+    """A bucketed seed must match its item's real length (mask sum), not the
+    padded width — a mis-sized seed is a loud error, never a silent mis-seed."""
+    from fpwap import Sweep
+    from fpwap.callbacks.common import RawActivations
+
+    torch.manual_seed(SEED + 9)
+    length, max_len = 12, 16
+    padded = torch.zeros(1, max_len, dtype=torch.long)
+    padded[0, :length] = torch.randint(0, VOCAB, (length,))
+    mask = torch.zeros(1, max_len, dtype=torch.long)
+    mask[0, :length] = 1
+    # Seed sized to the padded width (16) instead of the real length (12).
+    bad_seed = torch.zeros(max_len, HIDDEN)
+
+    sweep = Sweep(
+        model=str(bucket_snapshot),
+        dataset=[{"input_ids": padded, "attention_mask": mask, "residual": bad_seed}],
+        seq_len=max_len,
+        padding="bucketed",
+        callbacks=[RawActivations(layers=[3], hook="residual_post")],
+        transport_dtype=torch.float32,
+        execution_device="cpu",
+        microbatch_size=1,
+        start_layer=2,
+        progress=False,
+    )
+    with pytest.raises(ValueError, match="real_len"):
+        sweep.run()
