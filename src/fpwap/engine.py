@@ -675,11 +675,19 @@ def _stack_seed_residuals(items: list[Any]) -> Tensor:
     return torch.stack([item["residual"] for item in items], dim=0)
 
 
-def _validate_seed_items(items: list[Any], seq_len: int, hidden: int) -> None:
+def _validate_seed_items(
+    items: list[Any], seq_len: int, hidden: int, *, bucketed: bool
+) -> None:
     """A resume seeds the residual buffer instead of embedding; every item must
-    carry a full-sequence `residual` `[seq_len, hidden]` (the input to block
-    `start_layer`). A partial-position residual is not resumable — block
-    `start_layer` attends over the whole prefix."""
+    carry a full-sequence ``residual`` ``[real_len, hidden]`` (the input to block
+    ``start_layer``). A partial-position residual is not resumable — block
+    ``start_layer`` attends over the whole prefix.
+
+    Under ``padding="fixed"`` every item is the same length, so the seed must be
+    exactly ``[seq_len, hidden]``. Under ``padding="bucketed"`` items vary in
+    length, so each seed must match that item's own real length (its
+    ``attention_mask`` sum) — segment building pads it up to the bucket
+    alongside ``input_ids``."""
     for i, item in enumerate(items):
         res = item.get("residual")
         if res is None:
@@ -687,10 +695,20 @@ def _validate_seed_items(items: list[Any], seq_len: int, hidden: int) -> None:
                 "start_layer > 0 seeds the residual buffer, so every dataset item "
                 f"needs a 'residual' tensor; item {i} has none"
             )
-        if res.dim() != 2 or res.shape[0] != seq_len or res.shape[1] != hidden:
+        if bucketed:
+            mask = item.get("attention_mask")
+            if not isinstance(mask, Tensor):
+                raise ValueError(
+                    "padding='bucketed' resume needs an attention_mask on every "
+                    f"item to size its seed residual; item {i} has none"
+                )
+            expected_len = int(mask.sum().item())
+        else:
+            expected_len = seq_len
+        if res.dim() != 2 or res.shape[0] != expected_len or res.shape[1] != hidden:
             raise ValueError(
                 f"seed residual for item {i} must have shape "
-                f"(seq_len={seq_len}, hidden={hidden}); got {tuple(res.shape)}"
+                f"(real_len={expected_len}, hidden={hidden}); got {tuple(res.shape)}"
             )
 
 
@@ -728,9 +746,29 @@ def _detect_left_padding(items: list[Any]) -> bool:
     return True
 
 
+def _trim_residual(t: Tensor, target_len: int, left_padded: bool) -> Tensor:
+    """Pad/trim a seed residual ``[seq, hidden]`` to ``target_len`` on its
+    sequence axis (the side matching the item's padding)."""
+    cur = t.shape[0]
+    if cur == target_len:
+        return t
+    if cur > target_len:
+        return t[-target_len:] if left_padded else t[:target_len]
+    pad = torch.zeros(target_len - cur, t.shape[1], dtype=t.dtype, device=t.device)
+    return torch.cat([pad, t], dim=0) if left_padded else torch.cat([t, pad], dim=0)
+
+
 def _trim_to_length(item: dict[str, Any], target_len: int, left_padded: bool) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, val in item.items():
+        if key == "residual" and isinstance(val, Tensor):
+            # The seed residual [real_len, hidden] rides along with input_ids:
+            # pad/trim its sequence axis to the bucket so Pass 0 writes it into
+            # the [n, bseq, hidden] buffer. Pad positions are causally inert and
+            # the in-loop right-pad trim drops them before the forward, so the
+            # seeded forward still runs at the item's real length.
+            result[key] = _trim_residual(val, target_len, left_padded)
+            continue
         if key not in ("input_ids", "attention_mask") or not isinstance(val, Tensor):
             result[key] = val
             continue
@@ -954,13 +992,20 @@ class Sweep:
     already falls out of the callbacks: the loop stops at the deepest layer any
     callback targets and skips the embedding-to-there and the final norm + head.
     ``start_layer`` is the symmetric lower bound — seed the residual buffer with
-    a stored residual (one ``"residual"`` tensor ``[seq_len, hidden]`` per
-    dataset item, the input to block ``start_layer``) and run only blocks
-    ``[start_layer, N)``. With ``start_layer == 0`` (the default) the buffer is
-    seeded by the embedding pass as usual. Re-running a sub-range of blocks over
-    a bit-identical seed reproduces the cold pass bitwise, so a resume is exact,
-    not approximate — the seed's dtype is the only thing that can perturb it, and
-    that is the caller's to guarantee. Seed mode requires ``padding="fixed"``.
+    a stored residual (one ``"residual"`` tensor per dataset item, the input to
+    block ``start_layer``) and run only blocks ``[start_layer, N)``. With
+    ``start_layer == 0`` (the default) the buffer is seeded by the embedding
+    pass as usual. Re-running a sub-range of blocks over a bit-identical seed
+    reproduces the cold pass bitwise, so a resume is exact, not approximate —
+    the seed's dtype is the only thing that can perturb it, and that is the
+    caller's to guarantee.
+
+    Seed mode works under ``padding="fixed"`` (every item the same length, seed
+    ``[seq_len, hidden]``) and ``padding="bucketed"`` (items of differing
+    length, each seed ``[real_len, hidden]`` matching its ``attention_mask``):
+    bucketed batches units that share a ``start_layer`` into one resume sweep,
+    and the in-loop right-pad trim runs each unit at its real length, so the
+    batched resume matches a solo per-unit resume bitwise.
     """
 
     def __init__(
@@ -1314,13 +1359,20 @@ class Sweep:
         hidden = int(hidden_attr)
         seeding = self.start_layer > 0
         if seeding:
-            if self.padding != "fixed":
+            if self.padding not in ("fixed", "bucketed"):
                 raise NotImplementedError(
-                    "start_layer > 0 (resume from residual) requires padding='fixed'. "
-                    "A resume runs a single start_layer per sweep; batch units that "
-                    "share a seed depth and pad them to a common seq_len."
+                    "start_layer > 0 (resume from residual) supports padding "
+                    f"'fixed' and 'bucketed', not {self.padding!r}."
                 )
-            _validate_seed_items(items, self.seq_len, hidden)
+            # A resume runs a single start_layer per sweep. Under 'fixed' every
+            # item is the same length; under 'bucketed' items of differing
+            # length each carry a real-length seed, and the in-loop right-pad
+            # trim runs each microbatch (size 1) at its real length — so a
+            # batched resume reproduces a solo per-unit resume bitwise, exactly
+            # as cold bucketed reproduces cold fixed.
+            _validate_seed_items(
+                items, self.seq_len, hidden, bucketed=self.padding == "bucketed"
+            )
         pl.resolve_dataset_s = (time.perf_counter_ns() - t0) / 1e9
 
         _emit_progress("preloop_ensure_embedding", -1, 0, 0)
