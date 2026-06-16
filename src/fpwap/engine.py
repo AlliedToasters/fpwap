@@ -39,6 +39,17 @@ from fpwap.types import (
 ProgressReporter = Callable[["ProgressEvent"], None]
 
 
+def _weight_prefetch_enabled() -> bool:
+    """Whether to overlap next-layer weight loads with current-layer compute.
+
+    Disabled by default for correctness. On large MoE fp8 sweeps, concurrent
+    worker-thread module mutation plus staged CUDA copies can corrupt activations
+    or trip device-side index asserts. Keep the fast path opt-in until it has a
+    stronger synchronization contract.
+    """
+    return os.environ.get("FPWAP_PREFETCH_LOAD", "0") not in ("0", "false", "False")
+
+
 @dataclass(frozen=True)
 class ProgressEvent:
     """Emitted by the engine at layer and batch boundaries.
@@ -535,20 +546,24 @@ class _OffloadStreamer(_LayerStreamer):
             for target, plan in plans.items()
         }
         self._advisor = ShardPageAdvisor(accel_index, virtual_sources=virtual_sources)
-        # Single-worker pool: next layer's load runs on a worker thread so
-        # safetensors read + H2D overlap with the main thread's compute on
-        # the current layer. Modern GPUs have a separate copy engine, so
-        # worker-stream H2D and main-stream compute progress concurrently.
+        # Optional single-worker pool: next layer's load runs on a worker
+        # thread so safetensors read + H2D overlap with the main thread's
+        # compute on the current layer. This is an explicit opt-in because
+        # staged worker-thread prefetch has triggered activation corruption on
+        # long Qwen3-MoE fp8 sweeps.
         import concurrent.futures as _cf
         import weakref
 
-        self._prefetch_pool: _cf.ThreadPoolExecutor | None = _cf.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="fpwap-prefetch"
-        )
+        self._prefetch_pool: _cf.ThreadPoolExecutor | None = None
+        if _weight_prefetch_enabled():
+            self._prefetch_pool = _cf.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="fpwap-prefetch"
+            )
         # Safety net: if Sweep.run() raises before reaching the explicit
         # close() at the end, the finalizer shuts the pool down on GC so a
         # caller looping Sweep constructions doesn't leak worker threads.
-        weakref.finalize(self, _cf.ThreadPoolExecutor.shutdown, self._prefetch_pool, True)
+        if self._prefetch_pool is not None:
+            weakref.finalize(self, _cf.ThreadPoolExecutor.shutdown, self._prefetch_pool, True)
 
     def ensure_embedding_loaded(self, model: nn.Module, plumbing: ModelPlumbing) -> None:
         device = self.execution_device
