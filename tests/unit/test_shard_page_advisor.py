@@ -5,14 +5,18 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
+import fpwap.loader as loader
 from fpwap.loader import (
+    _LIBC,
     ShardPageAdvisor,
     _parse_safetensors_offsets,
     _phys_ram_bytes,
     _resident_page_budget,
+    release_resident_pages,
 )
 
 
@@ -277,3 +281,130 @@ class TestResidentPageCache:
         with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
             advisor.advise_dontneed(["model.layers.0.self_attn.q_proj.weight"])
             assert mock_fadvise.call_count == 1
+
+
+@pytest.mark.skipif(_LIBC is None, reason="needs libc mmap/mlock/mincore")
+class TestResidentPagePinning:
+    """FPWAP_PAGE_RESIDENT_PIN: make residency binding via mlock so the kernel
+    cannot reclaim the resident set under memory pressure (issue #21)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_global_pins(self):
+        release_resident_pages()
+        loader._WARNED.clear()
+        yield
+        release_resident_pages()
+        loader._WARNED.clear()
+
+    def _pin_advisor(self, tmp_path: Path, budget_gb: str = "1") -> ShardPageAdvisor:
+        index = _make_accel_index(_make_shard(tmp_path))
+        with patch.dict(
+            os.environ,
+            {
+                "FPWAP_PAGE_RESIDENT": "1",
+                "FPWAP_PAGE_RESIDENT_GB": budget_gb,
+                "FPWAP_PAGE_RESIDENT_PIN": "1",
+            },
+        ):
+            return ShardPageAdvisor(index)
+
+    def test_pin_enabled_mlocks_and_is_resident(self, tmp_path: Path) -> None:
+        advisor = self._pin_advisor(tmp_path)
+        assert advisor._pin_enabled
+        name = "model.layers.0.self_attn.q_proj.weight"
+        # No DONTNEED in the resident branch; instead the bytes get mlock'd.
+        with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
+            advisor.advise_dontneed([name])
+            mock_fadvise.assert_not_called()
+        assert frozenset([name]) in advisor._resident_keys
+        assert loader._PINNED_REGIONS, "pin must mmap+mlock the layer's bytes globally"
+        # mincore: the pinned bytes are fully resident.
+        path, start, end = advisor._offsets[name]
+        resident, total = advisor._mincore_resident_pages(
+            advisor._pin_fd(path), start, end
+        )
+        assert total and resident == total
+        advisor.close()
+
+    def test_pins_persist_across_advisors(self, tmp_path: Path) -> None:
+        # The crux of issue #21: a second sweep's advisor reuses the first's
+        # pins instead of re-locking — so the resident set survives the
+        # per-unit Sweep teardown rather than being rebuilt every unit.
+        name = "model.layers.0.self_attn.q_proj.weight"
+        a1 = self._pin_advisor(tmp_path)
+        a1.advise_dontneed([name])
+        n_after_first = len(loader._PINNED_REGIONS)
+        total_after_first = loader._PINNED_TOTAL
+        a1.close()  # streamer teardown must NOT release the global pins
+        assert loader._PINNED_REGIONS, "close() must keep global pins resident"
+
+        a2 = self._pin_advisor(tmp_path)
+        a2.advise_dontneed([name])  # same range → reused, not re-locked
+        assert len(loader._PINNED_REGIONS) == n_after_first
+        assert loader._PINNED_TOTAL == total_after_first
+        a2.close()
+
+    def test_close_keeps_global_pins_drops_fds(self, tmp_path: Path) -> None:
+        advisor = self._pin_advisor(tmp_path)
+        advisor.advise_dontneed(["model.layers.0.self_attn.q_proj.weight"])
+        assert loader._PINNED_REGIONS
+        advisor.close()
+        assert loader._PINNED_REGIONS  # globals survive teardown
+        assert advisor._pin_fds == {}
+        release_resident_pages()
+        assert not loader._PINNED_REGIONS  # explicit release tears them down
+
+    def test_pin_disabled_keeps_legacy_advisory(self, tmp_path: Path) -> None:
+        index = _make_accel_index(_make_shard(tmp_path))
+        advisor = ShardPageAdvisor(index)  # PIN unset → advisory-only
+        advisor._budget = 10_000
+        assert not advisor._pin_enabled
+        with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
+            advisor.advise_dontneed(["model.layers.0.self_attn.q_proj.weight"])
+            mock_fadvise.assert_not_called()
+        assert not loader._PINNED_REGIONS  # tracked resident, but never mlock'd
+
+    def test_memlock_limit_clamps_budget(self, tmp_path: Path) -> None:
+        # rlimit below the requested budget → clamp + warn, pin stays enabled.
+        index = _make_accel_index(_make_shard(tmp_path))
+        with patch("fpwap.loader._memlock_limit_bytes", return_value=(4 << 30)):
+            with patch.dict(
+                os.environ,
+                {
+                    "FPWAP_PAGE_RESIDENT": "1",
+                    "FPWAP_PAGE_RESIDENT_GB": "8",  # 8 GB requested
+                    "FPWAP_PAGE_RESIDENT_PIN": "1",
+                },
+            ):
+                advisor = ShardPageAdvisor(index)
+        assert advisor._pin_enabled
+        # clamped to rlimit minus the pinned-buffer headroom
+        assert advisor._budget == (4 << 30) - (2 << 30)
+
+    def test_pin_failure_falls_back_to_dontneed(self, tmp_path: Path) -> None:
+        advisor = self._pin_advisor(tmp_path)
+        name = "model.layers.0.self_attn.q_proj.weight"
+        with patch.object(advisor, "_pin", return_value=False):
+            with patch("fpwap.loader.os.posix_fadvise") as mock_fadvise:
+                advisor.advise_dontneed([name])
+                assert mock_fadvise.call_count == 1  # evicted, not pretended resident
+        assert frozenset([name]) not in advisor._resident_keys
+        assert advisor._warned_evict  # one-time exhaustion note
+        advisor.close()
+
+    def test_mincore_watchdog_warns_on_eviction(self, tmp_path: Path, capsys) -> None:
+        # Advisory-only mode: when the resident set has been reclaimed, the
+        # periodic mincore check emits a one-time I/O-bound warning.
+        index = _make_accel_index(_make_shard(tmp_path))
+        advisor = ShardPageAdvisor(index)
+        advisor._budget = 10_000
+        name = "model.layers.0.self_attn.q_proj.weight"
+        advisor.advise_dontneed([name])  # marks resident (advise_calls=1)
+        from fpwap.loader import _RESIDENCY_CHECK_EVERY
+
+        advisor._advise_calls = _RESIDENCY_CHECK_EVERY - 1
+        with patch.object(advisor, "_mincore_resident_pages", return_value=(0, 10)):
+            advisor.advise_dontneed([name])  # tick → check fires, sees 0% resident
+        out = capsys.readouterr().out
+        assert "re-faulting" in out
+        assert advisor._warned_evict

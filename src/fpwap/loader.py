@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import ctypes
+import ctypes.util
 import json
 import os
+import resource
 import struct
 import time
 from dataclasses import dataclass, field
@@ -15,6 +18,105 @@ from safetensors import safe_open
 from torch import nn
 
 _HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
+
+# Page-pinning machinery for the resident-weight cache. preadv-based loading
+# makes a weight "resident" only by leaving its pages in the OS page cache;
+# omitting DONTNEED is advisory, and under real memory pressure (no free RAM +
+# the surprise sweep's emit/staging buffers) the kernel reclaims those clean
+# file-backed pages anyway, silently re-faulting the "resident" set from disk
+# every sweep. mlock'ing the pages makes residency binding; mincore lets us
+# detect (and warn about) eviction when pinning is off. All optional — absent
+# libc/posix_fadvise, the advisor falls back to the advisory-only behavior.
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+_PROT_READ = 0x1
+_MAP_SHARED = 0x01
+_MAP_POPULATE = 0x8000  # Linux-specific: prefault the range on mmap
+_MAP_FAILED = ctypes.c_void_p(-1).value
+# mincore watchdog (advisory-only mode): sample residency every N advise calls
+# (~2 sweeps of a 48-layer model) and warn once if the resident set has been
+# evicted below this fraction.
+_RESIDENCY_CHECK_EVERY = 96
+_RESIDENCY_WARN_BELOW = 0.5
+# Headroom under RLIMIT_MEMLOCK left for torch/CUDA pinned staging buffers
+# (the staged loader pins ~one layer; CUDA pins context buffers) so weight
+# pinning doesn't starve them and trip mlock ENOMEM.
+_PIN_HEADROOM = 2 << 30
+
+# Process-global registry of mlock'd weight-page regions, keyed by
+# (shard_path, aligned_offset, aligned_len) -> mapped address. Pins persist
+# across Sweep/streamer teardown: lens issues one Sweep per unit (shard_tokens=
+# 1), so a per-advisor pin would be locked and released every unit and never
+# reused. Holding them process-globally keeps the resident weight set warm
+# across units. release_resident_pages() tears it down (tests / model switch).
+_PINNED_REGIONS: dict[tuple[str, int, int], int] = {}
+_PINNED_TOTAL = 0
+# One-time warning keys already emitted this process (the advisor is rebuilt
+# per Sweep — one per unit at shard_tokens=1 — so per-instance guards would spam).
+_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _WARNED:
+        _WARNED.add(key)
+        print(message, flush=True)
+
+
+def _pin_cap_bytes() -> int:
+    """How many bytes may be globally mlock'd: RLIMIT_MEMLOCK minus headroom."""
+    return max(0, _memlock_limit_bytes() - _PIN_HEADROOM)
+
+
+def release_resident_pages() -> None:
+    """munlock + munmap every globally pinned weight region (process-wide)."""
+    global _PINNED_TOTAL
+    if _LIBC is not None:
+        for (_path, _start, length), addr in _PINNED_REGIONS.items():
+            try:
+                _LIBC.munlock(ctypes.c_void_p(addr), length)
+                _LIBC.munmap(ctypes.c_void_p(addr), length)
+            except OSError:
+                pass
+    _PINNED_REGIONS.clear()
+    _PINNED_TOTAL = 0
+
+
+def _load_libc() -> ctypes.CDLL | None:
+    if not _HAS_POSIX_FADVISE:  # gates on Linux-ish platforms
+        return None
+    name = ctypes.util.find_library("c")
+    if name is None:
+        return None
+    try:
+        libc = ctypes.CDLL(name, use_errno=True)
+    except OSError:
+        return None
+    try:
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_long,
+        ]
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+    except AttributeError:
+        return None
+    return libc
+
+
+_LIBC = _load_libc()
+
+
+def _memlock_limit_bytes() -> int:
+    """Soft RLIMIT_MEMLOCK in bytes; a large sentinel for 'unlimited'."""
+    try:
+        soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    except (ValueError, OSError, AttributeError):
+        return 0
+    if soft == resource.RLIM_INFINITY:
+        return 1 << 62
+    return int(soft)
 
 
 def _phys_ram_bytes() -> int:
@@ -837,9 +939,37 @@ class ShardPageAdvisor:
         self._budget = _resident_page_budget()
         self._resident_keys: set[frozenset[str]] = set()
         self._resident_bytes = 0
+        # mlock pinning: opt-in, makes residency binding instead of advisory.
+        self._pin_enabled = (
+            self._budget > 0
+            and _LIBC is not None
+            and os.environ.get("FPWAP_PAGE_RESIDENT_PIN") in ("1", "true", "True")
+        )
+        self._pin_fds: dict[str, int] = {}
+        # mincore watchdog state (advisory-only mode)
+        self._advise_calls = 0
+        self._warned_evict = False
         if not _HAS_POSIX_FADVISE:
             self._budget = 0
+            self._pin_enabled = False
             return
+        if self._pin_enabled:
+            # Can only lock as much as RLIMIT_MEMLOCK allows; clamp the resident
+            # budget to it (minus headroom) so the pinned prefix fits and the
+            # rest is DONTNEED'd. Unlimited rlimit leaves the budget untouched.
+            cap = _pin_cap_bytes()
+            if cap < self._budget:
+                want_gb = self._budget / 1e9
+                self._budget = max(0, cap)
+                _warn_once(
+                    "clamp",
+                    f"fpwap: FPWAP_PAGE_RESIDENT_PIN=1 but RLIMIT_MEMLOCK only allows "
+                    f"~{max(0, cap) / 1e9:.1f} GB of the requested {want_gb:.1f} GB "
+                    f"resident budget; pinning the prefix that fits and DONTNEED'ing "
+                    f"the rest. Raise `ulimit -l` (or grant CAP_IPC_LOCK) to pin more.",
+                )
+            if self._budget <= 0:
+                self._pin_enabled = False
 
         shard_paths: set[str] = set()
         for entry in accel_index.values():
@@ -904,16 +1034,168 @@ class ShardPageAdvisor:
         # the largest cacheable contiguous prefix. A full-depth sweep larger
         # than the budget thus stays bounded; a truncated/repeated sweep that
         # fits runs fully warm.
+        #
+        # With FPWAP_PAGE_RESIDENT_PIN the resident prefix is mlock'd so the
+        # kernel cannot reclaim it under memory pressure — without it, "keep
+        # resident" is only advisory (omit DONTNEED) and a memory-pressured box
+        # silently re-faults the set from disk every sweep, which the mincore
+        # watchdog below detects and warns about.
+        # Tick the residency watchdog on every advise call (not just resident
+        # ones) so its cadence tracks sweeps regardless of how much of the
+        # model fits the budget.
+        self._maybe_check_residency()
         if self._budget:
             key = frozenset(weight_names)
             if key in self._resident_keys:
                 return
             layer_bytes = self._bytes_for(weight_names)
             if self._resident_bytes + layer_bytes <= self._budget:
-                self._resident_keys.add(key)
-                self._resident_bytes += layer_bytes
-                return
+                if not self._pin_enabled or self._pin(weight_names):
+                    self._resident_keys.add(key)
+                    self._resident_bytes += layer_bytes
+                    return
+                # Pinning was requested but failed (rlimit/OOM): don't pretend
+                # the layer is resident — evict it explicitly so behavior is
+                # predictable, and note the exhaustion once.
+                self._note_pin_failed()
         self._advise(weight_names, os.POSIX_FADV_DONTNEED)
 
     def advise_willneed(self, weight_names: list[str]) -> None:
         self._advise(weight_names, os.POSIX_FADV_WILLNEED)
+
+    # -- pinning / residency verification --------------------------------
+
+    def _ranges_by_shard(self, weight_names: list[str]) -> dict[str, list[tuple[int, int]]]:
+        """Resolve weight names (expanding virtual sources) to merged byte
+        ranges per shard file."""
+        expanded: list[str] = []
+        for name in weight_names:
+            expanded.extend(self._virtual_sources.get(name, (name,)))
+        by_shard: dict[str, list[tuple[int, int]]] = {}
+        for name in expanded:
+            if name not in self._offsets:
+                continue
+            path, start, end = self._offsets[name]
+            by_shard.setdefault(path, []).append((start, end))
+        for path, ranges in by_shard.items():
+            ranges.sort()
+            merged: list[tuple[int, int]] = []
+            for start, end in ranges:
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            by_shard[path] = merged
+        return by_shard
+
+    def _pin_fd(self, path: str) -> int:
+        fd = self._pin_fds.get(path)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
+            self._pin_fds[path] = fd
+        return fd
+
+    def _pin(self, weight_names: list[str]) -> bool:
+        """mmap(MAP_SHARED|MAP_POPULATE) + mlock each of *weight_names*' byte
+        ranges into the process-global registry so the page cache pages backing
+        them cannot be reclaimed. preadv of the same ranges then always hits the
+        locked pages (page cache is per-inode, shared across fds). Ranges
+        already pinned by an earlier sweep are reused, not re-locked — this is
+        what makes the resident set survive the per-unit Sweep teardown. Returns
+        False if a range can't be locked (rlimit/OOM) so the caller falls back
+        to DONTNEED; regions locked before the failure stay pinned (still
+        useful)."""
+        assert _LIBC is not None
+        global _PINNED_TOTAL
+        cap = _pin_cap_bytes()
+        for path, ranges in self._ranges_by_shard(weight_names).items():
+            for start, end in ranges:
+                a_start = start - (start % _PAGE_SIZE)
+                a_len = end - a_start
+                a_len = ((a_len + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE
+                key = (path, a_start, a_len)
+                if key in _PINNED_REGIONS:
+                    continue  # already locked by an earlier sweep — reuse
+                if _PINNED_TOTAL + a_len > cap:
+                    return False  # would exceed the memlock budget
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    addr = _LIBC.mmap(
+                        None, a_len, _PROT_READ, _MAP_SHARED | _MAP_POPULATE, fd, a_start
+                    )
+                finally:
+                    os.close(fd)  # mapping + lock survive fd close
+                if addr is None or addr == _MAP_FAILED:
+                    return False
+                if _LIBC.mlock(ctypes.c_void_p(addr), a_len) != 0:
+                    _LIBC.munmap(ctypes.c_void_p(addr), a_len)
+                    return False
+                _PINNED_REGIONS[key] = addr
+                _PINNED_TOTAL += a_len
+        return True
+
+    def _note_pin_failed(self) -> None:
+        self._warned_evict = True
+        _warn_once(
+            "pin_failed",
+            f"fpwap: page-resident pinning hit a limit at "
+            f"{self._resident_bytes / 1e9:.1f} GB (RLIMIT_MEMLOCK / available RAM); "
+            f"remaining layers will be DONTNEED'd and re-read each sweep. Raise "
+            f"`ulimit -l` to pin the full weight set.",
+        )
+
+    def _maybe_check_residency(self) -> None:
+        """Advisory-only mode: periodically verify (via mincore) that the
+        resident set the advisor *believes* warm is actually in the page cache,
+        and warn once if the kernel has reclaimed it (the silent I/O-bound
+        regime). Pinned mode skips this — mlock guarantees residency."""
+        if self._pin_enabled or self._warned_evict or _LIBC is None:
+            return
+        self._advise_calls += 1
+        if self._advise_calls % _RESIDENCY_CHECK_EVERY or not self._resident_keys:
+            return
+        resident, total = 0, 0
+        for key in self._resident_keys:
+            for path, ranges in self._ranges_by_shard(list(key)).items():
+                fd = self._pin_fd(path)
+                for start, end in ranges:
+                    r, n = self._mincore_resident_pages(fd, start, end)
+                    resident += r
+                    total += n
+        if total and resident / total < _RESIDENCY_WARN_BELOW:
+            self._warned_evict = True
+            print(
+                f"fpwap: page-resident weights re-faulting — only "
+                f"{resident / total:.0%} of the {self._resident_bytes / 1e9:.1f} GB "
+                f"resident set is still in the page cache; this capture is I/O-bound "
+                f"(weights re-read from disk every sweep). Raise RAM headroom, reduce "
+                f"the swept footprint, or set FPWAP_PAGE_RESIDENT_PIN=1 (needs "
+                f"`ulimit -l`).",
+                flush=True,
+            )
+
+    def _mincore_resident_pages(self, fd: int, start: int, end: int) -> tuple[int, int]:
+        """(resident_pages, total_pages) for [start, end) of *fd* via mincore.
+        A read-only MAP_SHARED mapping (no POPULATE) reflects current cache
+        state without faulting pages in."""
+        assert _LIBC is not None
+        a_start = start - (start % _PAGE_SIZE)
+        a_len = end - a_start
+        a_len = ((a_len + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE
+        npages = a_len // _PAGE_SIZE
+        addr = _LIBC.mmap(None, a_len, _PROT_READ, _MAP_SHARED, fd, a_start)
+        if addr is None or addr == _MAP_FAILED:
+            return 0, npages
+        vec = ctypes.create_string_buffer(npages)
+        resident = 0
+        if _LIBC.mincore(ctypes.c_void_p(addr), a_len, vec) == 0:
+            resident = sum(1 for b in vec.raw if b & 1)
+        _LIBC.munmap(ctypes.c_void_p(addr), a_len)
+        return resident, npages
+
+    def close(self) -> None:
+        # Globally pinned weight regions deliberately survive teardown so the
+        # resident set stays warm across the per-unit sweeps; release them with
+        # release_resident_pages(). Here we only drop this advisor's mincore fds.
+        _close_fds(self._pin_fds)
+        self._pin_fds = {}

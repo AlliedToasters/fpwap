@@ -634,6 +634,7 @@ class _OffloadStreamer(_LayerStreamer):
             self._prefetch_pool = None
         if self._staged is not None:
             self._staged.close()
+        self._advisor.close()
 
 
 def _make_chunks(n_layers: int, chunk_size: int, start_layer: int = 0) -> list[range]:
