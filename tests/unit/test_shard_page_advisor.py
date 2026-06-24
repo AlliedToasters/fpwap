@@ -1,6 +1,7 @@
 """Unit tests for ShardPageAdvisor and safetensors offset parsing — CI-safe."""
 from __future__ import annotations
 
+import ctypes
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +19,26 @@ from fpwap.loader import (
     _resident_page_budget,
     release_resident_pages,
 )
+
+
+def _probe_mlock() -> bool:
+    """Can this environment actually mmap+mlock a page? CI runners / containers
+    often cap RLIMIT_MEMLOCK near zero, where pinning is impossible and the pin
+    tests are not applicable (the fix degrades to advisory-only there)."""
+    if _LIBC is None:
+        return False
+    size = loader._PAGE_SIZE
+    addr = _LIBC.mmap(None, size, loader._PROT_READ | 0x2, 0x02 | 0x20, -1, 0)  # PRIVATE|ANON
+    if addr is None or addr == loader._MAP_FAILED:
+        return False
+    ok = _LIBC.mlock(ctypes.c_void_p(addr), size) == 0
+    if ok:
+        _LIBC.munlock(ctypes.c_void_p(addr), size)
+    _LIBC.munmap(ctypes.c_void_p(addr), size)
+    return ok
+
+
+_MLOCK_OK = _probe_mlock()
 
 
 def _make_shard(tmp_path: Path, name: str = "model.safetensors") -> Path:
@@ -283,7 +304,7 @@ class TestResidentPageCache:
             assert mock_fadvise.call_count == 1
 
 
-@pytest.mark.skipif(_LIBC is None, reason="needs libc mmap/mlock/mincore")
+@pytest.mark.skipif(not _MLOCK_OK, reason="environment can't mmap/mlock (RLIMIT_MEMLOCK too low)")
 class TestResidentPagePinning:
     """FPWAP_PAGE_RESIDENT_PIN: make residency binding via mlock so the kernel
     cannot reclaim the resident set under memory pressure (issue #21)."""
@@ -292,7 +313,14 @@ class TestResidentPagePinning:
     def _clear_global_pins(self):
         release_resident_pages()
         loader._WARNED.clear()
+        # CI runners cap RLIMIT_MEMLOCK very low, which would clamp the pin
+        # budget to 0 and disable pinning. Pretend a generous limit so the pin
+        # *logic* is exercised; the tiny test shards still mlock fine under the
+        # real limit (a page or two). Tests that assert the clamp re-patch this.
+        memlock = patch("fpwap.loader._memlock_limit_bytes", return_value=1 << 40)
+        memlock.start()
         yield
+        memlock.stop()
         release_resident_pages()
         loader._WARNED.clear()
 
