@@ -8,6 +8,7 @@ import os
 import resource
 import struct
 import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -586,6 +587,38 @@ def _close_fds(fds: dict[str, int]) -> None:
     fds.clear()
 
 
+class _FdCache:
+    """Thread-safe path → ``O_RDONLY`` fd cache.
+
+    The staged-read pool hammers the check-then-open on a cold first access,
+    and an unsynchronized cache leaks one fd per racing thread, loader
+    instance after loader instance (#89). ``dict.setdefault`` is atomic
+    under the GIL, so exactly one open wins the cache; losers close their
+    fd and adopt the winner's.
+
+    Owns its fds: ``close()`` (idempotent) releases them, and a GC finalizer
+    backstops a caller that never reaches close. The finalizer holds the
+    dict, not ``self``, so it doesn't keep the cache alive.
+    """
+
+    def __init__(self) -> None:
+        self._fds: dict[str, int] = {}
+        weakref.finalize(self, _close_fds, self._fds)
+
+    def get(self, path: str) -> int:
+        fd = self._fds.get(path)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
+            won = self._fds.setdefault(path, fd)
+            if won != fd:
+                os.close(fd)
+                return won
+        return fd
+
+    def close(self) -> None:
+        _close_fds(self._fds)
+
+
 class StagedLayerLoader:
     """Pinned-staging layer loader: direct byte reads + one async H2D per layer.
 
@@ -654,18 +687,13 @@ class StagedLayerLoader:
         self._pending: torch.cuda.Event | None = None
         self._broken = False  # pinned alloc failed; permanent fallback
         self._offsets: dict[str, dict[str, tuple[int, int]]] = {}
-        self._fds: dict[str, int] = {}
+        self._fds = _FdCache()  # shard fds, shared with the staged-read pool
         self._pool: Any | None = None
         # Byte-assembly trust state, keyed by layer-relative param name
         # (layers are structurally identical, so one verification covers
         # the pattern across all layers).
         self._verified: set[str] = set()
         self._tensor_path: set[str] = set()
-        # Safety net: close shard fds on GC if close() is never reached
-        # (holds the dict, not self, so the finalizer doesn't pin the loader).
-        import weakref
-
-        weakref.finalize(self, _close_fds, self._fds)
 
     def close(self) -> None:
         # The last H2D may still be in flight on the copy stream; it reads
@@ -677,7 +705,7 @@ class StagedLayerLoader:
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None
-        _close_fds(self._fds)
+        self._fds.close()
 
     def _range_of_key(self, key: str) -> _SourceRange | None:
         entry = self._accel_index.get(key)
@@ -722,11 +750,7 @@ class StagedLayerLoader:
         return ranges
 
     def _fd(self, path: str) -> int:
-        fd = self._fds.get(path)
-        if fd is None:
-            fd = os.open(path, os.O_RDONLY)
-            self._fds[path] = fd
-        return fd
+        return self._fds.get(path)
 
     def load_layer(
         self, model: nn.Module, layer_idx: int, plumbing: Any
@@ -945,7 +969,7 @@ class ShardPageAdvisor:
             and _LIBC is not None
             and os.environ.get("FPWAP_PAGE_RESIDENT_PIN") in ("1", "true", "True")
         )
-        self._pin_fds: dict[str, int] = {}
+        self._pin_fds = _FdCache()  # mincore-watchdog fds
         # mincore watchdog state (advisory-only mode)
         self._advise_calls = 0
         self._warned_evict = False
@@ -1089,11 +1113,7 @@ class ShardPageAdvisor:
         return by_shard
 
     def _pin_fd(self, path: str) -> int:
-        fd = self._pin_fds.get(path)
-        if fd is None:
-            fd = os.open(path, os.O_RDONLY)
-            self._pin_fds[path] = fd
-        return fd
+        return self._pin_fds.get(path)
 
     def _pin(self, weight_names: list[str]) -> bool:
         """mmap(MAP_SHARED|MAP_POPULATE) + mlock each of *weight_names*' byte
@@ -1197,5 +1217,4 @@ class ShardPageAdvisor:
         # Globally pinned weight regions deliberately survive teardown so the
         # resident set stays warm across the per-unit sweeps; release them with
         # release_resident_pages(). Here we only drop this advisor's mincore fds.
-        _close_fds(self._pin_fds)
-        self._pin_fds = {}
+        self._pin_fds.close()
