@@ -378,7 +378,7 @@ class TestResidentPagePinning:
         assert loader._PINNED_REGIONS
         advisor.close()
         assert loader._PINNED_REGIONS  # globals survive teardown
-        assert advisor._pin_fds == {}
+        assert advisor._pin_fds._fds == {}
         release_resident_pages()
         assert not loader._PINNED_REGIONS  # explicit release tears them down
 
